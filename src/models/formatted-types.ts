@@ -54,6 +54,13 @@ export enum OutputType {
   Change = 2,
 }
 
+export type AccessCardData = {
+  name: string;
+  description: string;
+};
+
+export type EncryptedAccessCardData = string;
+
 export type NoteAnnotationData = {
   outputType: OutputType; // Chunk 0: Byte 1 (1)
   senderRandom: string; // Chunk 0: Bytes 2-16 (15)
