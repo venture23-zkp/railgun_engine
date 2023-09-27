@@ -1,14 +1,12 @@
 import chai from 'chai';
-import chaiAsPromised from 'chai-as-promised';
 import memdown from 'memdown';
-import { AccessCardData, NoteAnnotationData, OutputType } from '../../models/formatted-types';
+import { AccessCardData } from '../../models/formatted-types';
 import { AccessCard } from '../access-card';
 import WalletInfo from '../../wallet/wallet-info';
 import { config } from '../../test/config.test';
 import { Database } from '../../database/database';
 import { RailgunWallet } from '../../wallet/railgun-wallet';
 
-chai.use(chaiAsPromised);
 const { expect } = chai;
 
 const testMnemonic = config.mnemonic;
@@ -34,8 +32,8 @@ describe('AccessCard', function run() {
     const sender = wallet.getViewingKeyPair();
 
     const accessCardData: AccessCardData = {
-      name: 'Test Card',
-      description: 'This is a sample description for AccessCard Test',
+      name: 'n',
+      description: 'd',
     };
 
     const encryptedAccessCardData = AccessCard.encryptCardInfo(accessCardData, sender.privateKey);
@@ -45,7 +43,7 @@ describe('AccessCard', function run() {
     );
   });
 
-  it('Should encrypt and decrypt empty access card name and/or description', async () => {
+  it('Should encrypt and decrypt access card name and/or description as empty string', async () => {
     const sender = wallet.getViewingKeyPair();
 
     const accessCardData1: AccessCardData = {
@@ -76,21 +74,23 @@ describe('AccessCard', function run() {
     );
   });
 
-  it('Should encode and decode empty access card', async () => {
-    expect(AccessCard.encodeAccessCardInfo(undefined)).to.equal('');
+  it('Should not encode and decode empty access card', async () => {
+    expect(function () {
+      AccessCard.encodeAccessCardInfo(undefined);
+    }).to.throw('name and description are required');
+
     expect(AccessCard.decodeAccessCardInfo('')).to.equal(undefined);
   });
 
-  it('Should encode and decode long access card description', async () => {
+  it('Should not encode and decode long access card description (>30bytes)', async () => {
     const accessCardData: AccessCardData = {
       name: 'name',
-      description:
-        'A really long memo with emojis 😐👩🏾‍🔧😎 and other text !@#$%^&*() Private memo field 🤡🙀🥰👩🏿‍🚒🧞 🤡 🙀 🥰 👩🏿‍🚒 🧞, in order to test a major memo for a real live production use case.',
+      description: 'A really long memo with em',
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
     expect(encoded).to.deep.equal(
-      '7b226e616d65223a226e616d65222c226465736372697074696f6e223a2241207265616c6c79206c6f6e67206d656d6f207769746820656d6f6a697320f09f9890f09f91a9f09f8fbee2808df09f94a7f09f988e20616e64206f7468657220746578742021402324255e262a28292050726976617465206d656d6f206669656c6420f09fa4a1f09f9980f09fa5b0f09f91a9f09f8fbfe2808df09f9a92f09fa79e20f09fa4a120f09f998020f09fa5b020f09f91a9f09f8fbfe2808df09f9a9220f09fa79e2c20696e206f7264657220746f20746573742061206d616a6f72206d656d6f20666f722061207265616c206c6976652070726f64756374696f6e2075736520636173652e227d',
+      '30366e616d6541207265616c6c79206c6f6e67206d656d6f207769746820656d',
     );
 
     const decoded = AccessCard.decodeAccessCardInfo(encoded);
@@ -99,25 +99,25 @@ describe('AccessCard', function run() {
 
   it('Should encode and decode access card description - new line over an emoji', async () => {
     const accessCardData = {
-      name: 'Test name',
-      description: `Private memo field 🙀🥰👩🏿‍🚒🧞 🤡 🙀 🥰 👩🏿‍🚒 🧞,
-                    🤡`,
+      name: '',
+      description: `memo 🙀🧞🧞a,
+      🤡`,
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
     expect(encoded).to.deep.equal(
-      '7b226e616d65223a2254657374206e616d65222c226465736372697074696f6e223a2250726976617465206d656d6f206669656c6420f09f9980f09fa5b0f09f91a9f09f8fbfe2808df09f9a92f09fa79e20f09fa4a120f09f998020f09fa5b020f09f91a9f09f8fbfe2808df09f9a9220f09fa79e2c5c6e2020202020202020202020202020202020202020f09fa4a1227d',
+      '30326d656d6f20f09f9980f09fa79ef09fa79e612c0a202020202020f09fa4a1',
     );
 
     const decoded = AccessCard.decodeAccessCardInfo(encoded);
     expect(decoded).to.deep.equal(accessCardData);
   });
 
-  it('Should encode and decode access card without emojis', async () => {
+  it('Should encode and decode access card upto 30 characters', async () => {
     const accessCardData = {
-      name: 'This is a really long name in order to test a major access for a real live production use case',
+      name: 'Name',
       description:
-        'A really long access card in order to test a major access for a real live production use case.',
+        'A really long access card.',
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
