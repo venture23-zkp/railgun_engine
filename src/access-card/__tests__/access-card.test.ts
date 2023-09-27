@@ -82,19 +82,15 @@ describe('AccessCard', function run() {
     expect(AccessCard.decodeAccessCardInfo('')).to.equal(undefined);
   });
 
-  it('Should not encode and decode long access card description (>30bytes)', async () => {
+  it('Should not encode long access card description (>30bytes)', async () => {
     const accessCardData: AccessCardData = {
       name: 'name',
-      description: 'A really long memo with em',
+      description: 'A really long memo with a lot of information',
     };
 
-    const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
-    expect(encoded).to.deep.equal(
-      '30366e616d6541207265616c6c79206c6f6e67206d656d6f207769746820656d',
-    );
-
-    const decoded = AccessCard.decodeAccessCardInfo(encoded);
-    expect(decoded).to.deep.equal(accessCardData);
+    expect(function() {
+      AccessCard.encodeAccessCardInfo(accessCardData);
+    }).to.throw('Combined length of name and description can only be upto 30 bytes')
   });
 
   it('Should encode and decode access card description - new line over an emoji', async () => {
