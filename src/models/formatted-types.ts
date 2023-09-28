@@ -56,7 +56,6 @@ export enum OutputType {
 
 export type AccessCardData = {
   name: string;
-  description: string;
 };
 
 export type EncryptedAccessCardData = string;

@@ -12,11 +12,9 @@ if (isReactNative) {
  * Use this class to encrypt/decrypt/encode/decode access card info.
  */
 export class AccessCard {
-  private static DELIMITER_LENGTH = 2;
-
   /**
    * Attempts to decrypt the encrypted access card info with the given private key
-   * @param encryptedCardData encrypted access card `name` and `description`
+   * @param encryptedCardData encrypted access card `name`
    * @param viewingPrivateKey wallet viewing private key to decrypt with
    * @returns decrypted access card info on success. Returns undefined otherwise.
    */
@@ -47,7 +45,7 @@ export class AccessCard {
 
   /**
    * Encrypt the given access card info with AES 256 encryption algorithm
-   * @param accessCardInfo `name` and `description` of access card
+   * @param accessCardInfo `name` of access card
    * @param viewingPrivateKey wallet viewing private key to encrypt with
    * @returns encrypted access card data as string
    */
@@ -63,29 +61,25 @@ export class AccessCard {
   }
 
   /**
-   * Encodes the given `name` and `description`
-   * @param accessCardInfo `name` and `description` of access card
+   * Encodes the given `name` 
+   * @param accessCardInfo `name` and of access card
    * @returns encoded access card info
    */
   static encodeAccessCardInfo(accessCardInfo: Optional<AccessCardData>): string {
     if (
       !isDefined(accessCardInfo) ||
-      !isDefined(accessCardInfo.name) ||
-      !isDefined(accessCardInfo.description)
+      !isDefined(accessCardInfo.name)
     ) {
-      throw new Error('name and description are required');
+      throw new Error('name is required');
     }
 
-    const { name, description } = accessCardInfo;
-    const dataToEncode = name + description;
-    const delimiterIndex = this.DELIMITER_LENGTH + name.length; // delimiter for name & description
-    const prefix = delimiterIndex.toString().padStart(this.DELIMITER_LENGTH, '0');
+    const { name } = accessCardInfo;
 
-    const encoded = hexlify(new TextEncoder().encode(prefix + dataToEncode));
+    const encoded = hexlify(new TextEncoder().encode(name));
 
-    // encoded data should be less than or equal to 30bytes (2 bytes for delimiter index)
-    if (encoded.length > 64) {
-      throw new Error('Combined length of name and description can only be upto 30 bytes');
+    // encoded data should be less than or equal to 16bytes
+    if (encoded.length > 32) {
+      throw new Error('name can only be upto 16 characters long');
     }
 
     return encoded;
@@ -96,16 +90,12 @@ export class AccessCard {
    * @returns `AccessCardData` on success. Returns `undefined` otherwise
    */
   static decodeAccessCardInfo(encoded: string): Optional<AccessCardData> {
-    if (!encoded.length) {
-      return undefined;
-    }
-
     try {
-      const decodedText = new TextDecoder().decode(Buffer.from(arrayify(encoded)));
-      const delimiterIndex = parseInt(decodedText.slice(0, this.DELIMITER_LENGTH));
-      const name = decodedText.slice(this.DELIMITER_LENGTH, delimiterIndex);
-      const description = decodedText.slice(delimiterIndex);
-      return { name, description };
+      const decodedText = new TextDecoder().decode(
+        Buffer.from(arrayify(encoded)),
+      );
+
+      return { name: decodedText };
     } catch (err) {
       return undefined;
     }

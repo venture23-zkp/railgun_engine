@@ -32,8 +32,7 @@ describe('AccessCard', function run() {
     const sender = wallet.getViewingKeyPair();
 
     const accessCardData: AccessCardData = {
-      name: 'n',
-      description: 'd',
+      name: 'sample 1 name',
     };
 
     const encryptedAccessCardData = AccessCard.encryptCardInfo(accessCardData, sender.privateKey);
@@ -43,77 +42,56 @@ describe('AccessCard', function run() {
     );
   });
 
-  it('Should encrypt and decrypt access card name and/or description as empty string', async () => {
+  it('Should encrypt and decrypt access card name as empty string', async () => {
     const sender = wallet.getViewingKeyPair();
 
-    const accessCardData1: AccessCardData = {
-      name: 'Test Card without description',
-      description: '',
-    };
-    const accessCardData2: AccessCardData = {
+    const accessCardData: AccessCardData = {
       name: '',
-      description: 'Test Card without name',
-    };
-    const accessCardData3: AccessCardData = {
-      name: '',
-      description: '',
     };
 
-    const encryptedAccessCardData1 = AccessCard.encryptCardInfo(accessCardData1, sender.privateKey);
-    const encryptedAccessCardData2 = AccessCard.encryptCardInfo(accessCardData2, sender.privateKey);
-    const encryptedAccessCardData3 = AccessCard.encryptCardInfo(accessCardData3, sender.privateKey);
-
-    expect(AccessCard.decryptCardInfo(encryptedAccessCardData1, sender.privateKey)).to.deep.equal(
-      accessCardData1,
-    );
-    expect(AccessCard.decryptCardInfo(encryptedAccessCardData2, sender.privateKey)).to.deep.equal(
-      accessCardData2,
-    );
-    expect(AccessCard.decryptCardInfo(encryptedAccessCardData3, sender.privateKey)).to.deep.equal(
-      accessCardData3,
+    const encrypted = AccessCard.encryptCardInfo(accessCardData, sender.privateKey);
+    
+    expect(AccessCard.decryptCardInfo(encrypted, sender.privateKey)).to.deep.equal(
+      accessCardData,
     );
   });
 
   it('Should not encode and decode empty access card', async () => {
     expect(function () {
       AccessCard.encodeAccessCardInfo(undefined);
-    }).to.throw('name and description are required');
+    }).to.throw('name is required');
 
-    expect(AccessCard.decodeAccessCardInfo('')).to.equal(undefined);
+    expect(AccessCard.decodeAccessCardInfo('')).to.deep.equal({ name: ''});
   });
 
-  it('Should not encode long access card description (>30bytes)', async () => {
+  it('Should not encode long access card (>16bytes)', async () => {
     const accessCardData: AccessCardData = {
-      name: 'name',
-      description: 'A really long memo with a lot of information',
+      name: 'A really longName',
     };
 
     expect(function() {
       AccessCard.encodeAccessCardInfo(accessCardData);
-    }).to.throw('Combined length of name and description can only be upto 30 bytes')
+    }).to.throw('name can only be upto 16 characters long')
   });
 
-  it('Should encode and decode access card description - new line over an emoji', async () => {
+  it('Should encode and decode access card name - new line over an emoji', async () => {
     const accessCardData = {
-      name: '',
-      description: `memo 🙀🧞🧞a,
-      🤡`,
+      name: `🧞,
+      🤡`
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
     expect(encoded).to.deep.equal(
-      '30326d656d6f20f09f9980f09fa79ef09fa79e612c0a202020202020f09fa4a1',
+      'f09fa79e2c0a202020202020f09fa4a1',
     );
 
     const decoded = AccessCard.decodeAccessCardInfo(encoded);
     expect(decoded).to.deep.equal(accessCardData);
   });
 
-  it('Should encode and decode access card upto 30 characters', async () => {
+  it('Should encode and decode access card upto 16 characters', async () => {
     const accessCardData = {
-      name: 'Name',
-      description:
-        'A really long access card.',
+      name: 'A valid nameData',
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
