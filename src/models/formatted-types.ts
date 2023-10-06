@@ -207,4 +207,6 @@ export type RelayAdaptShieldERC20Recipient = { tokenAddress: string; recipientAd
 export type RelayAdaptShieldNFTRecipient = {
   nftTokenData: NFTTokenData;
   recipientAddress: string;
+  // support '0' id and 0 amount for minting access-card-nft
+  amount: bigint;
 };

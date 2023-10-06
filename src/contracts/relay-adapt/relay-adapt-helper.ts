@@ -1,5 +1,5 @@
 import { ContractTransaction, AbiCoder, keccak256 } from 'ethers';
-import { randomHex, hexToBytes } from '../../utils/bytes';
+import { randomHex, hexToBytes, ByteLength, formatToByteLength } from '../../utils/bytes';
 import { ShieldNoteERC20 } from '../../note/erc20/shield-note-erc20';
 import { AddressData, decodeAddress } from '../../key-derivation';
 import {
@@ -51,8 +51,8 @@ class RelayAdaptHelper {
     shieldNFTRecipients: RelayAdaptShieldNFTRecipient[],
   ): Promise<ShieldRequestStruct[]> {
     return Promise.all(
-      shieldNFTRecipients.map(({ nftTokenData, recipientAddress }) => {
-        const value = RelayAdaptHelper.valueForNFTShield(nftTokenData);
+      shieldNFTRecipients.map(({ nftTokenData, recipientAddress, amount }) => {
+        const value = RelayAdaptHelper.valueForNFTShield(nftTokenData, amount);
         const addressData: AddressData = decodeAddress(recipientAddress);
         const shieldNFT = new ShieldNoteNFT(
           addressData.masterPublicKey,
@@ -69,10 +69,14 @@ class RelayAdaptHelper {
     );
   }
 
-  private static valueForNFTShield(nftTokenData: NFTTokenData): bigint {
+  private static valueForNFTShield(nftTokenData: NFTTokenData, explicitAmount?: bigint): bigint {
     switch (nftTokenData.tokenType) {
+      // amount 0n & id '0' for access-card mint
       case TokenType.ERC721:
-        return ERC721_NOTE_VALUE;
+        return explicitAmount === 0n &&
+          nftTokenData.tokenSubID === formatToByteLength('0', ByteLength.UINT_256, true)
+          ? 0n
+          : ERC721_NOTE_VALUE;
       case TokenType.ERC1155:
         return 0n; // 0n will automatically shield entire balance.
     }

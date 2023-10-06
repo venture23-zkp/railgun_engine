@@ -48,7 +48,12 @@ export const assertValidNoteToken = (tokenData: TokenData, value: bigint) => {
         throw new Error('ERC721 note must have tokenSubID parameter.');
       }
       if (value !== BigInt(1)) {
-        throw new Error('ERC721 note must have value of 1.');
+        // okay to have id '0' and value 0n for access card nft mint
+        if (
+          tokenData.tokenSubID !== formatToByteLength('0', ByteLength.UINT_256, true) ||
+          value !== 0n
+        )
+          throw new Error('ERC721 note must have value of 1.');
       }
       return;
     }
