@@ -1,6 +1,6 @@
 import { arrayify, hexlify } from '../utils';
 import { AccessCardData, EncryptedAccessCardData } from '../models';
-import { aes, isDefined, isReactNative } from '../utils';
+import { AES, isDefined, isReactNative } from '../utils';
 
 // TextEncoder/TextDecoder (used in this file) needs to shimmed in React Native
 if (isReactNative) {
@@ -37,7 +37,7 @@ export class AccessCard {
         data: [hexlified.substring(32)],
       };
 
-      const decrypted = aes.ctr.decrypt(metadataCipherText, viewingPrivateKey);
+      const decrypted = AES.decryptCTR(metadataCipherText, viewingPrivateKey);
 
       return AccessCard.decodeAccessCardInfo(decrypted[0]);
     } catch (err) {
@@ -57,7 +57,7 @@ export class AccessCard {
   ): EncryptedAccessCardData {
     const encodedAccessCard = AccessCard.encodeAccessCardInfo(accessCardInfo);
 
-    const { iv, data } = aes.ctr.encrypt([encodedAccessCard], viewingPrivateKey);
+    const { iv, data } = AES.encryptCTR([encodedAccessCard], viewingPrivateKey);
 
     return iv + data[0];
   }

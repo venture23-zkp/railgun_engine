@@ -448,7 +448,7 @@ describe('relay-adapt', function test() {
     const relayShieldInputs = await RelayAdaptHelper.generateRelayShieldRequests(
       shieldRandom,
       [],
-      [{ nftTokenData, recipientAddress: wallet.getAddress() }], // shieldNFTRecipients
+      [{ nftTokenData, recipientAddress: wallet.getAddress(), amount: 1n }], // shieldNFTRecipients
     );
 
     // 6. Get gas estimate from dummy txs.

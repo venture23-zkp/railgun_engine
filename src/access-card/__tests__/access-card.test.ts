@@ -6,6 +6,8 @@ import WalletInfo from '../../wallet/wallet-info';
 import { config } from '../../test/config.test';
 import { Database } from '../../database/database';
 import { RailgunWallet } from '../../wallet/railgun-wallet';
+import { Prover } from '../../prover/prover';
+import { testArtifactsGetter } from '../../test/helper.test';
 
 const { expect } = chai;
 
@@ -24,6 +26,7 @@ describe('AccessCard', function run() {
       testMnemonic,
       0,
       undefined, // creationBlockNumbers
+      new Prover(testArtifactsGetter),
     );
     WalletInfo.setWalletSource('accessCardWallet');
   });
@@ -90,9 +93,7 @@ describe('AccessCard', function run() {
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
-    expect(encoded).to.deep.equal(
-      '006d656d6f20f09f9980f09fa79ef09fa79e612c0a202020202020f09fa4a1',
-    );
+    expect(encoded).to.deep.equal('006d656d6f20f09f9980f09fa79ef09fa79e612c0a202020202020f09fa4a1');
 
     const decoded = AccessCard.decodeAccessCardInfo(encoded);
     expect(decoded).to.deep.equal(accessCardData);
@@ -101,8 +102,7 @@ describe('AccessCard', function run() {
   it('Should encode and decode access card that is 64 characters long)', async () => {
     const accessCardData = {
       name: 'Access Card Name',
-      description:
-        'A really long access card with values and other.',
+      description: 'A really long access card with values and other.',
     };
 
     const encoded = AccessCard.encodeAccessCardInfo(accessCardData);
@@ -116,10 +116,12 @@ describe('AccessCard', function run() {
       name: 'Access Card Name',
       description:
         'A really long access card with and other just text but over 64 characters long.',
-    }
+    };
 
-    expect(function() {
-      AccessCard.encodeAccessCardInfo(accessCardData)
-    }).to.throw('combined length of name and description should be less than or equal to 64 characters')
-  })
+    expect(function () {
+      AccessCard.encodeAccessCardInfo(accessCardData);
+    }).to.throw(
+      'combined length of name and description should be less than or equal to 64 characters',
+    );
+  });
 });
