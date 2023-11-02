@@ -58,12 +58,14 @@ const createNullUTXO = (nullNote: TransactNote): TXO => {
   return {
     tree: 0,
     position: 100000, // out of bounds position - so we don't have collisions on nullifiers
+    blockNumber: 100,
     timestamp: undefined,
     spendtxid: false,
     note: nullNote,
     txid: nullTxid,
     poisPerList: undefined,
     blindedCommitment: undefined,
+    transactCreationRailgunTxid: undefined,
     commitmentType: CommitmentType.TransactCommitment,
     nullifier: ZERO_32_BYTE_VALUE,
   };

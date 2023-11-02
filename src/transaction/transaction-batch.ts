@@ -16,11 +16,17 @@ import { stringifySafe } from '../utils/stringify';
 import { averageNumber } from '../utils/average';
 import { Chain } from '../models/engine-types';
 import { TransactNote } from '../note/transact-note';
-import { TXIDVersion, TreeBalance, UnprovedTransactionInputs } from '../models';
+import {
+  PreTransactionPOIsPerTxidLeafPerList,
+  TXIDVersion,
+  TreeBalance,
+  UnprovedTransactionInputs,
+} from '../models';
 import { getTokenDataHash } from '../note/note-util';
 import { AbstractWallet } from '../wallet';
 import { TransactionStruct } from '../abi/typechain/RailgunSmartWallet';
 import { isDefined } from '../utils/is-defined';
+import { POI } from '../poi';
 
 export const GAS_ESTIMATE_VARIANCE_DUMMY_TO_ACTUAL_TRANSACTION = 7500;
 
@@ -102,11 +108,17 @@ export class TransactionBatch {
   async generateValidSpendingSolutionGroupsAllOutputs(
     wallet: RailgunWallet,
     txidVersion: TXIDVersion,
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<SpendingSolutionGroup[]> {
     const tokenDatas: TokenData[] = this.getOutputTokenDatas();
     const spendingSolutionGroupsPerToken = await Promise.all(
       tokenDatas.map((tokenData) =>
-        this.generateValidSpendingSolutionGroups(wallet, txidVersion, tokenData),
+        this.generateValidSpendingSolutionGroups(
+          wallet,
+          txidVersion,
+          tokenData,
+          originShieldTxidForSpendabilityOverride,
+        ),
       ),
     );
     return spendingSolutionGroupsPerToken.flat();
@@ -120,6 +132,7 @@ export class TransactionBatch {
     wallet: RailgunWallet,
     txidVersion: TXIDVersion,
     tokenData: TokenData,
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<SpendingSolutionGroup[]> {
     const tokenHash = getTokenDataHash(tokenData);
     const tokenOutputs = this.outputs.filter((output) => output.tokenHash === tokenHash);
@@ -128,10 +141,14 @@ export class TransactionBatch {
     // Calculate total required to be supplied by UTXOs
     const totalRequired = outputTotal + this.unshieldTotal(tokenHash);
 
+    const balanceBucketFilter = await POI.getSpendableBalanceBuckets(this.chain);
+
     const treeSortedBalances = await wallet.balancesByTreeForToken(
       txidVersion,
       this.chain,
       tokenHash,
+      balanceBucketFilter,
+      originShieldTxidForSpendabilityOverride,
     );
     const tokenBalance = AbstractWallet.tokenBalanceAcrossAllTrees(treeSortedBalances);
 
@@ -148,15 +165,22 @@ export class TransactionBatch {
           const amountRequiredMessage = relayerFeeOutput
             ? `${totalRequired.toString()} (includes ${relayerFeeOutput.value.toString()} Relayer Fee)`
             : totalRequired.toString();
+          if (isDefined(originShieldTxidForSpendabilityOverride)) {
+            throw new Error(
+              `RAILGUN balance too low for ${
+                tokenData.tokenAddress
+              } from shield origin txid ${originShieldTxidForSpendabilityOverride}. Amount required: ${amountRequiredMessage}. Amount available: ${tokenBalance.toString()}.`,
+            );
+          }
           throw new Error(
-            `RAILGUN private token balance too low for ${
+            `RAILGUN spendable private balance too low for ${
               tokenData.tokenAddress
             }. Amount required: ${amountRequiredMessage}. Balance: ${tokenBalance.toString()}.`,
           );
         }
         case TokenType.ERC721:
         case TokenType.ERC1155:
-          throw new Error(`RAILGUN private NFT balance too low.`);
+          throw new Error(`RAILGUN spendable private NFT balance too low.`);
       }
     }
 
@@ -308,11 +332,17 @@ export class TransactionBatch {
     wallet: RailgunWallet,
     txidVersion: TXIDVersion,
     encryptionKey: string,
-    progressCallback: ProverProgressCallback,
-  ): Promise<TransactionStruct[]> {
+    progressCallback: (progress: number, status: string) => void,
+    shouldGeneratePreTransactionPOIs: boolean,
+    originShieldTxidForSpendabilityOverride?: string,
+  ): Promise<{
+    provedTransactions: TransactionStruct[];
+    preTransactionPOIsPerTxidLeafPerList: PreTransactionPOIsPerTxidLeafPerList;
+  }> {
     const spendingSolutionGroups = await this.generateValidSpendingSolutionGroupsAllOutputs(
       wallet,
       txidVersion,
+      originShieldTxidForSpendabilityOverride,
     );
     EngineDebug.log('Actual spending solution groups:');
     EngineDebug.log(
@@ -323,23 +353,14 @@ export class TransactionBatch {
       ),
     );
 
-    const individualProgressAmounts: number[] = new Array<number>(
-      spendingSolutionGroups.length,
-    ).fill(0);
-    const updateProgressCallback = () => {
-      const averageProgress = averageNumber(individualProgressAmounts);
-      progressCallback(averageProgress);
-    };
-
     const provedTransactions: TransactionStruct[] = [];
+
+    const preTransactionPOIsPerTxidLeafPerList: PreTransactionPOIsPerTxidLeafPerList = {};
+    const activeListKeys = POI.getActiveListKeys();
 
     for (let index = 0; index < spendingSolutionGroups.length; index += 1) {
       const spendingSolutionGroup = spendingSolutionGroups[index];
       const transaction = this.generateTransactionForSpendingSolutionGroup(spendingSolutionGroup);
-      const individualProgressCallback = (progress: number) => {
-        individualProgressAmounts[index] = progress;
-        updateProgressCallback();
-      };
       const { publicInputs, privateInputs, boundParams } =
         // eslint-disable-next-line no-await-in-loop
         await transaction.generateTransactionRequest(
@@ -348,6 +369,33 @@ export class TransactionBatch {
           encryptionKey,
           this.overallBatchMinGasPrice,
         );
+
+      if (shouldGeneratePreTransactionPOIs) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (let i = 0; i < activeListKeys.length; i += 1) {
+          const listKey = activeListKeys[i];
+          preTransactionPOIsPerTxidLeafPerList[listKey] ??= {};
+
+          const preTransactionProofProgressStatus = `Generating proof of spendability ${i + 1}/${
+            activeListKeys.length
+          }...`;
+
+          // eslint-disable-next-line no-await-in-loop
+          const { txidLeafHash, preTransactionPOI } = await wallet.generatePreTransactionPOI(
+            txidVersion,
+            this.chain,
+            listKey,
+            spendingSolutionGroup.utxos,
+            publicInputs,
+            privateInputs,
+            boundParams,
+            (progress: number) => progressCallback(progress, preTransactionProofProgressStatus),
+          );
+
+          preTransactionPOIsPerTxidLeafPerList[listKey][txidLeafHash] = preTransactionPOI;
+        }
+      }
+
       // eslint-disable-next-line no-await-in-loop
       const signature = await wallet.sign(publicInputs, encryptionKey);
       const unprovedTransactionInputs: UnprovedTransactionInputs = {
@@ -358,15 +406,20 @@ export class TransactionBatch {
       };
       // NOTE: For multisig, at this point the UnprovedTransactionInputs are
       // forwarded to the next participant, along with an array of signatures.
+
+      const preTransactionProofProgressStatus = `Generating transaction proof ${index + 1}/${
+        spendingSolutionGroups.length
+      }...`;
+
       // eslint-disable-next-line no-await-in-loop
       const provedTransaction = await transaction.generateProvedTransaction(
         prover,
         unprovedTransactionInputs,
-        individualProgressCallback,
+        (progress: number) => progressCallback(progress, preTransactionProofProgressStatus),
       );
       provedTransactions.push(provedTransaction);
     }
-    return provedTransactions;
+    return { provedTransactions, preTransactionPOIsPerTxidLeafPerList };
   }
 
   private static logDummySpendingSolutionGroupsSummary(
@@ -404,10 +457,12 @@ export class TransactionBatch {
     wallet: RailgunWallet,
     txidVersion: TXIDVersion,
     encryptionKey: string,
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<TransactionStruct[]> {
     const spendingSolutionGroups = await this.generateValidSpendingSolutionGroupsAllOutputs(
       wallet,
       txidVersion,
+      originShieldTxidForSpendabilityOverride,
     );
     TransactionBatch.logDummySpendingSolutionGroupsSummary(spendingSolutionGroups);
 

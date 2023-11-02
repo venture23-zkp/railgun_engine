@@ -4,20 +4,43 @@ import { Proof } from '../models/prover-types';
 import { Chain } from '../models/engine-types';
 import {
   BlindedCommitmentData,
+  LegacyTransactProofData,
   POIsPerList,
   TXIDVersion,
   TXOPOIListStatus,
 } from '../models/poi-types';
 import { POINodeInterface } from '../poi/poi-node-interface';
 import { MerkleProof } from '../models/formatted-types';
+import { POIList, POIListType } from '../poi';
 
 export const MOCK_LIST_KEY = 'test_list';
+
+export const MOCK_LIST: POIList = {
+  key: MOCK_LIST_KEY,
+  type: POIListType.Gather,
+  name: 'mock list',
+  description: 'mock',
+};
+
+export const MOCK_LIST_ACTIVE: POIList = {
+  key: MOCK_LIST_KEY,
+  type: POIListType.Active,
+  name: 'mock list',
+  description: 'mock',
+};
 
 export class TestPOINodeInterface extends POINodeInterface {
   // eslint-disable-next-line class-methods-use-this
   isActive() {
     return true;
   }
+
+  // eslint-disable-next-line class-methods-use-this
+  async isRequired(chain: Chain): Promise<boolean> {
+    return true;
+  }
+
+  static overridePOIsListStatus = TXOPOIListStatus.Valid;
 
   // eslint-disable-next-line class-methods-use-this
   async getPOIsPerList(
@@ -30,8 +53,9 @@ export class TestPOINodeInterface extends POINodeInterface {
     blindedCommitmentDatas.forEach((blindedCommitmentData) => {
       poisPerList[blindedCommitmentData.blindedCommitment] ??= {};
       listKeys.forEach((listKey) => {
-        // All "Missing"
-        poisPerList[blindedCommitmentData.blindedCommitment][listKey] = TXOPOIListStatus.Missing;
+        // Use 'override' value
+        poisPerList[blindedCommitmentData.blindedCommitment][listKey] =
+          TestPOINodeInterface.overridePOIsListStatus;
       });
     });
     return poisPerList;
@@ -59,6 +83,16 @@ export class TestPOINodeInterface extends POINodeInterface {
     txidMerklerootIndex: number,
     blindedCommitmentsOut: string[],
     railgunTxidIfHasUnshield: string,
+  ): Promise<void> {
+    return Promise.resolve();
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  async submitLegacyTransactProofs(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    listKeys: string[],
+    legacyTransactProofDatas: LegacyTransactProofData[],
   ): Promise<void> {
     return Promise.resolve();
   }

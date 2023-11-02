@@ -4,18 +4,23 @@ import { Proof } from '../models/prover-types';
 import { Chain } from '../models/engine-types';
 import {
   BlindedCommitmentData,
+  LegacyTransactProofData,
   POIsPerList,
   TXIDVersion,
   TXOPOIListStatus,
 } from '../models/poi-types';
-import { SentCommitment, TXO } from '../models/txo-types';
+import { SentCommitment, TXO, WalletBalanceBucket } from '../models/txo-types';
 import { isDefined, removeUndefineds } from '../utils/is-defined';
 import { POINodeInterface } from './poi-node-interface';
 import { UnshieldStoredEvent } from '../models/event-types';
+import { OutputType } from '../models';
+import { isShieldCommitmentType, isTransactCommitmentType } from '../utils/commitment';
 
 export type POIList = {
   key: string;
   type: POIListType;
+  name: string;
+  description: string;
 };
 
 export enum POIListType {
@@ -28,17 +33,73 @@ export class POI {
 
   private static nodeInterface: POINodeInterface;
 
+  private static launchBlocks: number[][] = [];
+
   static init(lists: POIList[], nodeInterface: POINodeInterface) {
     this.lists = lists;
     this.nodeInterface = nodeInterface;
+  }
+
+  static setLaunchBlock(chain: Chain, launchBlock: number) {
+    this.launchBlocks[chain.type] ??= [];
+    this.launchBlocks[chain.type][chain.id] = launchBlock;
+  }
+
+  static getLaunchBlock(chain: Chain): Optional<number> {
+    return this.launchBlocks[chain.type]?.[chain.id];
   }
 
   static getAllListKeys(): string[] {
     return this.lists.map((list) => list.key);
   }
 
-  private static getActiveListKeys(): string[] {
+  static getActiveListKeys(): string[] {
     return this.lists.filter((list) => list.type === POIListType.Active).map((list) => list.key);
+  }
+
+  static getBalanceBucket(txo: TXO): WalletBalanceBucket {
+    if (txo.spendtxid !== false) {
+      return WalletBalanceBucket.Spent;
+    }
+
+    const pois = txo.poisPerList;
+    const isChange = txo.note.outputType === OutputType.Change;
+
+    const activeListKeys = POI.getActiveListKeys();
+    if (!pois || !this.hasAllKeys(pois, activeListKeys)) {
+      if (isShieldCommitmentType(txo.commitmentType)) {
+        return WalletBalanceBucket.ShieldPending;
+      }
+      return isChange
+        ? WalletBalanceBucket.MissingInternalPOI
+        : WalletBalanceBucket.MissingExternalPOI;
+    }
+
+    if (POI.hasValidPOIsActiveLists(pois)) {
+      return WalletBalanceBucket.Spendable;
+    }
+
+    const anyPOIIsShieldBlocked = activeListKeys.some((listKey) => {
+      return pois[listKey] === TXOPOIListStatus.ShieldBlocked;
+    });
+    if (anyPOIIsShieldBlocked) {
+      return WalletBalanceBucket.ShieldBlocked;
+    }
+
+    if (isShieldCommitmentType(txo.commitmentType)) {
+      return WalletBalanceBucket.ShieldPending;
+    }
+
+    const anyPOIIsProofSubmitted = activeListKeys.some((listKey) => {
+      return pois[listKey] === TXOPOIListStatus.ProofSubmitted;
+    });
+    if (anyPOIIsProofSubmitted) {
+      return WalletBalanceBucket.ProofSubmitted;
+    }
+
+    return isChange
+      ? WalletBalanceBucket.MissingInternalPOI
+      : WalletBalanceBucket.MissingExternalPOI;
   }
 
   private static validatePOIStatusForAllLists(
@@ -62,12 +123,15 @@ export class POI {
     return this.validatePOIStatusForAllLists(pois, listKeys, [TXOPOIListStatus.Valid]);
   }
 
-  private static hasValidPOIsActiveLists(pois: POIsPerList): boolean {
+  static hasValidPOIsActiveLists(pois: Optional<POIsPerList>): boolean {
+    if (!pois) {
+      return false;
+    }
     const listKeys = this.getActiveListKeys();
     return this.validatePOIStatusForAllLists(pois, listKeys, [TXOPOIListStatus.Valid]);
   }
 
-  private static getAllListKeysWithValidPOIs(inputPOIsPerList: POIsPerList[]): string[] {
+  private static getAllListKeysWithValidInputPOIs(inputPOIsPerList: POIsPerList[]): string[] {
     const listKeys = this.getAllListKeys();
     const listKeysShouldGenerateSpentPOIs: string[] = [];
     listKeys.forEach((listKey) => {
@@ -86,7 +150,7 @@ export class POI {
     if (!isDefined(poisPerList)) {
       return listKeys;
     }
-    const submittedStatuses = [TXOPOIListStatus.TransactProofSubmitted, TXOPOIListStatus.Valid];
+    const submittedStatuses = [TXOPOIListStatus.ProofSubmitted, TXOPOIListStatus.Valid];
     const needsSpendPOI: string[] = [];
     for (const listKey of listKeys) {
       const isUnsubmitted =
@@ -102,16 +166,77 @@ export class POI {
     return keys.every((key) => Object.prototype.hasOwnProperty.call(obj, key));
   }
 
-  static getListKeysCanGenerateSpentPOIs(spentTXOs: TXO[], isLegacyPOIProof: boolean): string[] {
-    if (isLegacyPOIProof) {
-      // Use all list keys for legacy proofs.
-      return POI.getAllListKeys();
+  static getListKeysCanGenerateSpentPOIs(
+    spentTXOs: TXO[],
+    sentCommitments: SentCommitment[],
+    unshieldEvents: UnshieldStoredEvent[],
+    isLegacyPOIProof: boolean,
+  ): string[] {
+    if (!sentCommitments.length && !unshieldEvents.length) {
+      return [];
     }
+
     const inputPOIsPerList = removeUndefineds(spentTXOs.map((txo) => txo.poisPerList));
-    return POI.getAllListKeysWithValidPOIs(inputPOIsPerList);
+    const listKeysWithValidInputPOIs = isLegacyPOIProof
+      ? POI.getAllListKeys()
+      : POI.getAllListKeysWithValidInputPOIs(inputPOIsPerList);
+
+    const validStatuses = [TXOPOIListStatus.Valid, TXOPOIListStatus.ProofSubmitted];
+
+    return listKeysWithValidInputPOIs.filter((listKey) => {
+      // If all statuses are valid, then no need to generate new POIs.
+      const allSentCommitmentZeroOrPOIsValid = sentCommitments.every((sentCommitment) => {
+        if (sentCommitment.note.value === 0n) {
+          // If sentCommitment value is 0, then no need to generate new POIs.
+          return true;
+        }
+        const poiStatus = sentCommitment.poisPerList?.[listKey];
+        return poiStatus && validStatuses.includes(poiStatus);
+      });
+      const allUnshieldPOIsValid = unshieldEvents.every((unshieldEvent) => {
+        const poiStatus = unshieldEvent.poisPerList?.[listKey];
+        return poiStatus && validStatuses.includes(poiStatus);
+      });
+      const allPOIsValid = allSentCommitmentZeroOrPOIsValid && allUnshieldPOIsValid;
+      return !allPOIsValid;
+    });
   }
 
-  static shouldRetrieveCreationPOIs(txo: TXO) {
+  static getListKeysCanSubmitLegacyTransactEvents(TXOs: TXO[]): string[] {
+    const listKeys = this.getAllListKeys();
+    return listKeys.filter((listKey) => {
+      return !TXOs.every((txo) => txo.poisPerList?.[listKey] === TXOPOIListStatus.Valid);
+    });
+  }
+
+  static isLegacyTXO(chain: Chain, txo: TXO) {
+    const launchBlock = this.getLaunchBlock(chain);
+    if (!isDefined(launchBlock) || txo.blockNumber < launchBlock) {
+      return true;
+    }
+    return false;
+  }
+
+  static shouldSubmitLegacyTransactEventsTXOs(chain: Chain, txo: TXO) {
+    if (!isDefined(txo.transactCreationRailgunTxid)) {
+      return false;
+    }
+    if (!isDefined(txo.blindedCommitment)) {
+      return false;
+    }
+    if (!this.isLegacyTXO(chain, txo)) {
+      return false;
+    }
+    if (!isDefined(txo.poisPerList)) {
+      return false;
+    }
+    if (!isTransactCommitmentType(txo.commitmentType)) {
+      return false;
+    }
+    return !POI.hasValidPOIsAllLists(txo.poisPerList);
+  }
+
+  static shouldRetrieveTXOPOIs(txo: TXO) {
     if (!isDefined(txo.blindedCommitment)) {
       return false;
     }
@@ -121,8 +246,11 @@ export class POI {
     return !POI.hasValidPOIsAllLists(txo.poisPerList);
   }
 
-  static shouldRetrieveSpentPOIs(sentCommitment: SentCommitment) {
+  static shouldRetrieveSentCommitmentPOIs(sentCommitment: SentCommitment) {
     if (!isDefined(sentCommitment.blindedCommitment)) {
+      return false;
+    }
+    if (sentCommitment.note.value === 0n) {
       return false;
     }
     if (!isDefined(sentCommitment.poisPerList)) {
@@ -131,8 +259,21 @@ export class POI {
     return !POI.hasValidPOIsAllLists(sentCommitment.poisPerList);
   }
 
+  static shouldRetrieveUnshieldEventPOIs(unshieldEvent: UnshieldStoredEvent) {
+    if (!isDefined(unshieldEvent.railgunTxid)) {
+      return false;
+    }
+    if (!isDefined(unshieldEvent.poisPerList)) {
+      return true;
+    }
+    return !POI.hasValidPOIsAllLists(unshieldEvent.poisPerList);
+  }
+
   static shouldGenerateSpentPOIsSentCommitment(sentCommitment: SentCommitment) {
     if (!isDefined(sentCommitment.blindedCommitment)) {
+      return false;
+    }
+    if (sentCommitment.note.value === 0n) {
       return false;
     }
     if (!isDefined(sentCommitment.poisPerList)) {
@@ -161,6 +302,18 @@ export class POI {
     }
   }
 
+  static isRequiredForChain(chain: Chain): Promise<boolean> {
+    return this.nodeInterface.isRequired(chain);
+  }
+
+  static async getSpendableBalanceBuckets(chain: Chain): Promise<WalletBalanceBucket[]> {
+    const poiRequired = await this.isRequiredForChain(chain);
+    return poiRequired
+      ? [WalletBalanceBucket.Spendable]
+      : // Until POI is active, all balance buckets are spendable.
+        Object.values(WalletBalanceBucket);
+  }
+
   static async retrievePOIsForBlindedCommitments(
     txidVersion: TXIDVersion,
     chain: Chain,
@@ -168,6 +321,9 @@ export class POI {
   ): Promise<{ [blindedCommitment: string]: POIsPerList }> {
     if (!isDefined(this.nodeInterface)) {
       throw new Error('POI node interface not initialized');
+    }
+    if (blindedCommitmentDatas.length > 100) {
+      throw new Error('Cannot retrieve POIs for more than 100 blinded commitments at a time');
     }
     const listKeys = this.getAllListKeys();
     return this.nodeInterface.getPOIsPerList(txidVersion, chain, listKeys, blindedCommitmentDatas);
@@ -211,6 +367,24 @@ export class POI {
       txidMerklerootIndex,
       blindedCommitmentsOut,
       railgunTxidIfHasUnshield,
+    );
+  }
+
+  static async submitLegacyTransactProofs(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    listKeys: string[],
+    legacyTransactProofDatas: LegacyTransactProofData[],
+  ) {
+    if (!isDefined(this.nodeInterface)) {
+      throw new Error('POI node interface not initialized');
+    }
+
+    await this.nodeInterface.submitLegacyTransactProofs(
+      txidVersion,
+      chain,
+      listKeys,
+      legacyTransactProofDatas,
     );
   }
 }

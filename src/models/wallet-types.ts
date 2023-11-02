@@ -1,6 +1,6 @@
 import { UnshieldStoredEvent } from './event-types';
 import { NoteAnnotationData, TokenData } from './formatted-types';
-import { TXO } from './txo-types';
+import { TXO, WalletBalanceBucket } from './txo-types';
 
 export type WalletDetails = {
   treeScannedHeights: number[];
@@ -14,8 +14,8 @@ export type TreeBalance = {
   utxos: TXO[];
 };
 
-export type AllBalances = {
-  [txidVersion: string]: { [tokenHash: string]: TreeBalance };
+export type TokenBalancesAllTxidVersions = {
+  [txidVersion: string]: TokenBalances;
 };
 
 export type TokenBalances = {
@@ -53,6 +53,7 @@ export type TransactionHistoryTokenAmount = {
   amount: bigint;
   noteAnnotationData?: NoteAnnotationData;
   memoText: Optional<string>;
+  hasValidPOIForActiveLists: boolean;
 };
 export type TransactionHistoryTransferTokenAmount = TransactionHistoryTokenAmount & {
   recipientAddress: string;
@@ -63,6 +64,7 @@ export type TransactionHistoryUnshieldTokenAmount = TransactionHistoryTransferTo
 export type TransactionHistoryReceiveTokenAmount = TransactionHistoryTokenAmount & {
   senderAddress: Optional<string>;
   shieldFee: Optional<string>;
+  balanceBucket: WalletBalanceBucket;
 };
 export type TransactionHistoryEntryReceived = {
   txid: string;

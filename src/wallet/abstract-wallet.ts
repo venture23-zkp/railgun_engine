@@ -11,6 +11,7 @@ import { SpendingPublicKey, ViewingKeyPair, WalletNode } from '../key-derivation
 import {
   EngineEvent,
   POICurrentProofEventData,
+  POIProofEventStatus,
   UnshieldStoredEvent,
   WalletScannedEventData,
 } from '../models/event-types';
@@ -37,6 +38,7 @@ import {
   TXO,
   TXOsReceivedPOIStatusInfo,
   TXOsSpentPOIStatusInfo,
+  WalletBalanceBucket,
 } from '../models/txo-types';
 import { Memo, LEGACY_MEMO_METADATA_BYTE_CHUNKS } from '../note/memo';
 import {
@@ -55,7 +57,7 @@ import {
 import { getSharedSymmetricKey, signED25519 } from '../utils/keys-utils';
 import {
   AddressKeys,
-  AllBalances,
+  TokenBalancesAllTxidVersions,
   TotalBalancesByTreeNumber,
   ShareableViewingKeyData,
   TokenBalances,
@@ -82,9 +84,13 @@ import { ShieldNote } from '../note';
 import { getTokenDataERC20, getTokenDataHash, serializeTokenData } from '../note/note-util';
 import { TokenDataGetter } from '../token/token-data-getter';
 import { isDefined, removeDuplicates, removeUndefineds } from '../utils/is-defined';
-import { PublicInputsRailgun } from '../models/prover-types';
+import { PrivateInputsRailgun, PublicInputsRailgun } from '../models/prover-types';
 import { UTXOMerkletree } from '../merkletree/utxo-merkletree';
-import { isSentCommitment, isSentCommitmentType } from '../utils/commitment';
+import {
+  isShieldCommitmentType,
+  isTransactCommitment,
+  isTransactCommitmentType,
+} from '../utils/commitment';
 import { POI } from '../poi/poi';
 import {
   getBlindedCommitmentForShieldOrTransact,
@@ -95,17 +101,35 @@ import {
   ACTIVE_TXID_VERSIONS,
   BlindedCommitmentData,
   BlindedCommitmentType,
+  LegacyTransactProofData,
   POIEngineProofInputs,
   POIsPerList,
+  PreTransactionPOI,
   TXIDVersion,
 } from '../models/poi-types';
-import { getGlobalTreePosition } from '../poi/global-tree-position';
-import { createDummyMerkleProof } from '../merkletree/merkle-proof';
+import {
+  GLOBAL_UTXO_POSITION_PRE_TRANSACTION_POI_PROOF_HARDCODED_VALUE,
+  GLOBAL_UTXO_TREE_PRE_TRANSACTION_POI_PROOF_HARDCODED_VALUE,
+  getGlobalTreePosition,
+  getGlobalTreePositionPreTransactionPOIProof,
+} from '../poi/global-tree-position';
+import { createDummyMerkleProof, verifyMerkleProof } from '../merkletree/merkle-proof';
 import { Prover } from '../prover/prover';
 import {
   formatTXOsReceivedPOIStatusInfo,
   formatTXOsSpentPOIStatusInfo,
 } from '../poi/poi-status-formatter';
+import {
+  CURRENT_UTXO_MERKLETREE_HISTORY_VERSION,
+  ZERO_32_BYTE_VALUE,
+  delay,
+  stringifySafe,
+} from '../utils';
+import {
+  getRailgunTransactionIDFromBigInts,
+  getRailgunTxidLeafHash,
+} from '../transaction/railgun-txid';
+import { BoundParamsStruct } from '../abi/typechain/RailgunSmartWallet';
 
 type ScannedDBCommitment = PutBatch<string, Buffer>;
 
@@ -123,12 +147,13 @@ type CachedStoredSendCommitment = {
 
 type GeneratePOIsData = {
   railgunTxid: string;
+  txid: string;
   listKey: string;
   isLegacyPOIProof: boolean;
-  spentTXOs: TXO[];
+  orderedSpentTXOs: TXO[];
   txidMerkletreeData: TXIDMerkletreeData;
-  sentCommitments: SentCommitment[];
-  unshieldEvents: UnshieldStoredEvent[];
+  sentCommitmentsForRailgunTxid: SentCommitment[];
+  unshieldEventsForRailgunTxid: UnshieldStoredEvent[];
 };
 
 abstract class AbstractWallet extends EventEmitter {
@@ -152,13 +177,12 @@ abstract class AbstractWallet extends EventEmitter {
 
   private readonly prover: Prover;
 
+  private readonly isClearingBalances: boolean[][] = [];
+
   private creationBlockNumbers: Optional<number[][]>;
 
   // [type: [id: CachedStoredReceiveCommitment[]]]
-  private cachedReceiveCommitments: CachedStoredReceiveCommitment[][][] = [];
-
-  // [type: [id: CachedStoredSendCommitment[]]]
-  private cachedSendCommitments: CachedStoredSendCommitment[][][] = [];
+  private: CachedStoredReceiveCommitment[][][] = [];
 
   private generatingPOIsForChain: boolean[][] = [];
 
@@ -190,9 +214,32 @@ abstract class AbstractWallet extends EventEmitter {
   /**
    * Loads utxo merkle tree into wallet
    */
-  loadUTXOMerkletree(txidVersion: TXIDVersion, utxoMerkletree: UTXOMerkletree) {
+  async loadUTXOMerkletree(
+    txidVersion: TXIDVersion,
+    utxoMerkletree: UTXOMerkletree,
+  ): Promise<void> {
     this.utxoMerkletrees[txidVersion] ??= [];
     this.utxoMerkletrees[txidVersion][utxoMerkletree.chain.type] ??= [];
+
+    // Remove balances if the UTXO merkletree is out of date for this wallet.
+    const { chain } = utxoMerkletree;
+    const utxoMerkletreeHistoryVersion = await this.getUTXOMerkletreeHistoryVersion(chain);
+    if (
+      !isDefined(utxoMerkletreeHistoryVersion) ||
+      utxoMerkletreeHistoryVersion < CURRENT_UTXO_MERKLETREE_HISTORY_VERSION
+    ) {
+      await this.clearScannedBalances(txidVersion, chain);
+      await this.setUTXOMerkletreeHistoryVersion(chain, CURRENT_UTXO_MERKLETREE_HISTORY_VERSION);
+
+      this.utxoMerkletrees[txidVersion][utxoMerkletree.chain.type][utxoMerkletree.chain.id] =
+        utxoMerkletree;
+
+      // Kick off a synchronous refresh.
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.scanBalances(txidVersion, chain, () => {});
+      return;
+    }
+
     this.utxoMerkletrees[txidVersion][utxoMerkletree.chain.type][utxoMerkletree.chain.id] =
       utxoMerkletree;
   }
@@ -214,6 +261,29 @@ abstract class AbstractWallet extends EventEmitter {
     delete this.utxoMerkletrees[txidVersion]?.[chain.type]?.[chain.id];
   }
 
+  private getUTXOMerkletreeHistoryVersionDBPrefix(chain: Chain): string[] {
+    const path = [...this.getWalletDBPrefix(chain), 'merkleetree_history_version'];
+    if (chain != null) {
+      path.push(getChainFullNetworkID(chain));
+    }
+    return path;
+  }
+
+  setUTXOMerkletreeHistoryVersion(chain: Chain, merkletreeHistoryVersion: number): Promise<void> {
+    return this.db.put(
+      this.getUTXOMerkletreeHistoryVersionDBPrefix(chain),
+      merkletreeHistoryVersion,
+      'utf8',
+    );
+  }
+
+  getUTXOMerkletreeHistoryVersion(chain: Chain): Promise<Optional<number>> {
+    return this.db
+      .get(this.getUTXOMerkletreeHistoryVersionDBPrefix(chain), 'utf8')
+      .then((val: string) => parseInt(val, 10))
+      .catch(() => Promise.resolve(undefined));
+  }
+
   /**
    * Unload txid merkle tree by chain
    */
@@ -226,6 +296,7 @@ abstract class AbstractWallet extends EventEmitter {
   }
 
   private emitPOIProofUpdateEvent(
+    status: POIProofEventStatus,
     txidVersion: TXIDVersion,
     chain: Chain,
     progress: number,
@@ -234,8 +305,10 @@ abstract class AbstractWallet extends EventEmitter {
     railgunTxid: string,
     index: number,
     totalCount: number,
+    errorMsg: Optional<string>,
   ) {
     const updateData: POICurrentProofEventData = {
+      status,
       txidVersion,
       chain,
       progress,
@@ -244,6 +317,7 @@ abstract class AbstractWallet extends EventEmitter {
       railgunTxid,
       index,
       totalCount,
+      errorMsg,
     };
     this.emit(EngineEvent.POIProofUpdate, updateData);
   }
@@ -382,6 +456,9 @@ abstract class AbstractWallet extends EventEmitter {
         this.getWalletDetailsPath(chain),
       )) as BytesData;
       walletDetails = msgpack.decode(arrayify(walletDetailsEncoded)) as WalletDetails;
+      if (walletDetails.creationTree == null) {
+        walletDetails.creationTree = undefined;
+      }
       if (walletDetails.creationTreeHeight == null) {
         walletDetails.creationTreeHeight = undefined;
       }
@@ -636,9 +713,11 @@ abstract class AbstractWallet extends EventEmitter {
     if (noteReceive && serializedNoteReceive) {
       const nullifier = TransactNote.getNullifier(this.nullifyingKey, position);
       const storedReceiveCommitment: StoredReceiveCommitment = {
+        txidVersion,
         spendtxid: false,
         txid: leaf.txid,
         timestamp: leaf.timestamp,
+        blockNumber: leaf.blockNumber,
         nullifier: nToHex(nullifier, ByteLength.UINT_256),
         decrypted: noteReceive.serialize(),
         senderAddress: noteReceive.senderAddressData
@@ -647,6 +726,7 @@ abstract class AbstractWallet extends EventEmitter {
         commitmentType: leaf.commitmentType,
         poisPerList: undefined,
         blindedCommitment: undefined,
+        transactCreationRailgunTxid: 'railgunTxid' in leaf ? leaf.railgunTxid : undefined,
       };
       EngineDebug.log(`Adding RECEIVE commitment at ${position} (Wallet ${this.id}).`);
       scannedCommitments.push({
@@ -654,15 +734,11 @@ abstract class AbstractWallet extends EventEmitter {
         key: this.getWalletReceiveCommitmentDBPrefix(chain, tree, position).join(':'),
         value: msgpack.encode(storedReceiveCommitment),
       });
-      // AbstractWallet.addCachedStoredCommitment(chain, this.cachedReceiveCommitments, {
-      //   storedReceiveCommitment,
-      //   tree,
-      //   position,
-      // });
     }
 
     if (noteSend && serializedNoteSend) {
       const storedSendCommitment: StoredSendCommitment = {
+        txidVersion,
         txid: leaf.txid,
         timestamp: leaf.timestamp,
         decrypted: serializedNoteSend,
@@ -679,11 +755,6 @@ abstract class AbstractWallet extends EventEmitter {
         key: this.getWalletSentCommitmentDBPrefix(chain, tree, position).join(':'),
         value: msgpack.encode(storedSendCommitment),
       });
-      // AbstractWallet.addCachedStoredCommitment(chain, this.cachedSendCommitments, {
-      //   storedSendCommitment,
-      //   tree,
-      //   position,
-      // });
     }
 
     return scannedCommitments;
@@ -750,73 +821,59 @@ abstract class AbstractWallet extends EventEmitter {
   }
 
   private async queryAllStoredReceiveCommitments(
+    txidVersion: TXIDVersion,
     chain: Chain,
   ): Promise<CachedStoredReceiveCommitment[]> {
     const namespace = this.getWalletDBPrefix(chain);
     const keySplits = await this.keySplits(namespace, 5);
 
-    const dbStoredReceiveCommitments: CachedStoredReceiveCommitment[] = await Promise.all(
-      keySplits.map(async (keySplit) => {
-        const data = (await this.db.get(keySplit)) as BytesData;
-        const storedReceiveCommitment = msgpack.decode(arrayify(data)) as StoredReceiveCommitment;
+    const dbStoredReceiveCommitments: CachedStoredReceiveCommitment[] = removeUndefineds(
+      await Promise.all(
+        keySplits.map(async (keySplit) => {
+          const data = (await this.db.get(keySplit)) as BytesData;
+          const storedReceiveCommitment = msgpack.decode(arrayify(data)) as StoredReceiveCommitment;
 
-        const tree = numberify(keySplit[3]).toNumber();
-        const position = numberify(keySplit[4]).toNumber();
+          if (storedReceiveCommitment.txidVersion !== txidVersion) {
+            return undefined;
+          }
 
-        return { storedReceiveCommitment, tree, position };
-      }),
+          const tree = numberify(keySplit[3]).toNumber();
+          const position = numberify(keySplit[4]).toNumber();
+
+          return { storedReceiveCommitment, tree, position };
+        }),
+      ),
     );
     return dbStoredReceiveCommitments;
   }
 
-  private async queryAllStoredSendCommitments(chain: Chain): Promise<CachedStoredSendCommitment[]> {
-    // if (
-    //   isDefined(this.cachedSendCommitments[chain.type]) &&
-    //   isDefined(this.cachedSendCommitments[chain.type][chain.id])
-    // ) {
-    //   return this.cachedSendCommitments[chain.type][chain.id];
-    // }
-
+  private async queryAllStoredSendCommitments(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<CachedStoredSendCommitment[]> {
     const namespace = this.getWalletSentCommitmentDBPrefix(chain);
     const keySplits = await this.keySplits(namespace, 5);
 
-    const dbStoredSendCommitments: CachedStoredSendCommitment[] = await Promise.all(
-      keySplits.map(async (keySplit) => {
-        const data = (await this.db.get(keySplit)) as BytesData;
-        const storedSendCommitment = msgpack.decode(arrayify(data)) as StoredSendCommitment;
+    const dbStoredSendCommitments: CachedStoredSendCommitment[] = removeUndefineds(
+      await Promise.all(
+        keySplits.map(async (keySplit) => {
+          const data = (await this.db.get(keySplit)) as BytesData;
+          const storedSendCommitment = msgpack.decode(arrayify(data)) as StoredSendCommitment;
 
-        const tree = numberify(keySplit[3]).toNumber();
-        const position = numberify(keySplit[4]).toNumber();
+          if (storedSendCommitment.txidVersion !== txidVersion) {
+            return undefined;
+          }
 
-        return { storedSendCommitment, tree, position };
-      }),
+          const tree = numberify(keySplit[3]).toNumber();
+          const position = numberify(keySplit[4]).toNumber();
+
+          return { storedSendCommitment, tree, position };
+        }),
+      ),
     );
 
-    // this.cachedSendCommitments[chain.type] ??= [];
-    // this.cachedSendCommitments[chain.type][chain.id] = dbStoredSendCommitments;
     return dbStoredSendCommitments;
   }
-
-  // private static addCachedStoredCommitment<Cache extends { tree: number; position: number }[][][]>(
-  //   chain: Chain,
-  //   commitmentCache: Cache,
-  //   cachedCommitment: CachedStoredReceiveCommitment | CachedStoredSendCommitment,
-  // ) {
-  //   if (
-  //     !isDefined(commitmentCache[chain.type]) ||
-  //     !isDefined(commitmentCache[chain.type][chain.id])
-  //   ) {
-  //     return;
-  //   }
-  //   const cacheForChain = commitmentCache[chain.type][chain.id];
-  //   const found = cacheForChain.find((stored) => {
-  //     return stored.tree === cachedCommitment.tree && stored.position === cachedCommitment.position;
-  //   });
-  //   if (found) {
-  //     return;
-  //   }
-  //   cacheForChain.push(cachedCommitment);
-  // }
 
   /**
    * Get TXOs list of a chain
@@ -829,7 +886,10 @@ abstract class AbstractWallet extends EventEmitter {
     const merkletree = this.getUTXOMerkletree(txidVersion, chain);
     const tokenDataGetter = this.createTokenDataGetter(chain);
 
-    const storedReceiveCommitments = await this.queryAllStoredReceiveCommitments(chain);
+    const storedReceiveCommitments = await this.queryAllStoredReceiveCommitments(
+      txidVersion,
+      chain,
+    );
 
     return Promise.all(
       storedReceiveCommitments.map(async ({ storedReceiveCommitment, tree, position }) => {
@@ -854,9 +914,23 @@ abstract class AbstractWallet extends EventEmitter {
         }
 
         // Look up blinded commitment.
-        if (!isDefined(receiveCommitment.blindedCommitment)) {
+        if (
+          !isDefined(receiveCommitment.blindedCommitment) ||
+          (!isDefined(receiveCommitment.transactCreationRailgunTxid) &&
+            isTransactCommitmentType(receiveCommitment.commitmentType))
+        ) {
           const globalTreePosition = getGlobalTreePosition(tree, position);
           const commitment = await merkletree.getCommitment(tree, position);
+          if (
+            isTransactCommitment(commitment) &&
+            !isTransactCommitmentType(receiveCommitment.commitmentType)
+          ) {
+            // Should never happen
+            throw new Error('Fatal - Invalid commitment type');
+          }
+          if (isTransactCommitment(commitment)) {
+            receiveCommitment.transactCreationRailgunTxid = commitment.railgunTxid;
+          }
           receiveCommitment.blindedCommitment = getBlindedCommitmentForShieldOrTransact(
             commitment.hash,
             note.notePublicKey,
@@ -868,6 +942,7 @@ abstract class AbstractWallet extends EventEmitter {
         const txo: TXO = {
           tree,
           position,
+          blockNumber: receiveCommitment.blockNumber,
           txid: receiveCommitment.txid,
           timestamp: receiveCommitment.timestamp,
           spendtxid: receiveCommitment.spendtxid,
@@ -876,6 +951,7 @@ abstract class AbstractWallet extends EventEmitter {
           poisPerList: receiveCommitment.poisPerList,
           blindedCommitment: receiveCommitment.blindedCommitment,
           commitmentType: receiveCommitment.commitmentType,
+          transactCreationRailgunTxid: receiveCommitment.transactCreationRailgunTxid,
         };
         return txo;
       }),
@@ -898,7 +974,7 @@ abstract class AbstractWallet extends EventEmitter {
 
     const sentCommitments: SentCommitment[] = [];
 
-    const storedSendCommitments = await this.queryAllStoredSendCommitments(chain);
+    const storedSendCommitments = await this.queryAllStoredSendCommitments(txidVersion, chain);
 
     await Promise.all(
       storedSendCommitments.map(async ({ storedSendCommitment, tree, position }) => {
@@ -921,7 +997,7 @@ abstract class AbstractWallet extends EventEmitter {
           const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
           const commitment = await utxoMerkletree.getCommitment(tree, position);
 
-          if (isSentCommitment(commitment) && isDefined(commitment.railgunTxid)) {
+          if (isTransactCommitment(commitment) && isDefined(commitment.railgunTxid)) {
             sentCommitment.blindedCommitment = getBlindedCommitmentForShieldOrTransact(
               commitment.hash,
               note.notePublicKey,
@@ -961,13 +1037,6 @@ abstract class AbstractWallet extends EventEmitter {
       this.getWalletReceiveCommitmentDBPrefix(chain, tree, position),
       msgpack.encode(receiveCommitment),
     );
-    // Update cache
-    // this.cachedReceiveCommitments?.[chain.type]?.[chain.id].forEach((cachedCommitment) => {
-    //   if (cachedCommitment.tree === tree && cachedCommitment.position === position) {
-    //     // eslint-disable-next-line no-param-reassign
-    //     cachedCommitment.storedReceiveCommitment = receiveCommitment;
-    //   }
-    // });
   }
 
   private async updateSentCommitmentInDB(
@@ -980,13 +1049,6 @@ abstract class AbstractWallet extends EventEmitter {
       this.getWalletSentCommitmentDBPrefix(chain, tree, position),
       msgpack.encode(sentCommitment),
     );
-    // Update cache
-    // this.cachedSendCommitments?.[chain.type]?.[chain.id].forEach((cachedCommitment) => {
-    //   if (cachedCommitment.tree === tree && cachedCommitment.position === position) {
-    //     // eslint-disable-next-line no-param-reassign
-    //     cachedCommitment.storedSendCommitment = sentCommitment;
-    //   }
-    // });
   }
 
   async getTXOsReceivedPOIStatusInfo(
@@ -1023,21 +1085,129 @@ abstract class AbstractWallet extends EventEmitter {
     return totalListKeysCanGenerateSpentPOIs;
   }
 
+  async submitLegacyTransactPOIEventsReceiveCommitments(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<void> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    const txosNeedLegacyCreationPOIs = TXOs.filter((txo) =>
+      POI.shouldSubmitLegacyTransactEventsTXOs(chain, txo),
+    );
+    if (txosNeedLegacyCreationPOIs.length === 0) {
+      return;
+    }
+
+    const legacyTransactProofDatas: LegacyTransactProofData[] = [];
+
+    const txidMerkletree = this.getRailgunTXIDMerkletreeForChain(txidVersion, chain);
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const txo of txosNeedLegacyCreationPOIs) {
+      const txidIndex = await txidMerkletree.getTxidIndexByRailgunTxid(
+        txo.transactCreationRailgunTxid as string,
+      );
+      if (!isDefined(txidIndex)) {
+        EngineDebug.error(
+          new Error(
+            `txidIndex not found for railgunTxid - cannot submit legacy transact POI event: railgun txid ${
+              txo.transactCreationRailgunTxid ?? 'N/A'
+            }`,
+          ),
+        );
+        continue;
+      }
+      legacyTransactProofDatas.push({
+        txidIndex: txidIndex.toString(),
+        blindedCommitment: txo.blindedCommitment as string,
+        npk: nToHex(txo.note.notePublicKey, ByteLength.UINT_256, true),
+        value: txo.note.value.toString(),
+        tokenHash: txo.note.tokenHash,
+      });
+    }
+
+    const listKeys = POI.getListKeysCanSubmitLegacyTransactEvents(TXOs);
+
+    await POI.submitLegacyTransactProofs(
+      txidVersion,
+      chain,
+      listKeys,
+      legacyTransactProofDatas.slice(0, 100), // 100 max in request
+    );
+
+    // Delay slightly, so POI queue can index the events. Refresh after submitting all legacy events.
+    await delay(1000);
+    await this.refreshReceivePOIsAllTXOs(txidVersion, chain);
+  }
+
+  async receiveCommitmentHasValidPOI(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    commitment: string,
+  ): Promise<boolean> {
+    const cachedStoredReceiveCommitments = await this.queryAllStoredReceiveCommitments(
+      txidVersion,
+      chain,
+    );
+
+    const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
+
+    const formattedCommitment = formatToByteLength(commitment, ByteLength.UINT_256);
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const cachedStoredReceiveCommitment of cachedStoredReceiveCommitments) {
+      const receiveCommitment = await utxoMerkletree.getCommitment(
+        cachedStoredReceiveCommitment.tree,
+        cachedStoredReceiveCommitment.position,
+      );
+      if (!isTransactCommitmentType(receiveCommitment.commitmentType)) {
+        continue;
+      }
+      if (formattedCommitment === formatToByteLength(receiveCommitment.hash, ByteLength.UINT_256)) {
+        return POI.hasValidPOIsActiveLists(
+          cachedStoredReceiveCommitment.storedReceiveCommitment.poisPerList,
+        );
+      }
+    }
+    return false;
+  }
+
+  async getChainTxidsStillPendingSpentPOIs(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<string[]> {
+    const { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs } =
+      await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(txidVersion, chain);
+
+    const txids = [...sentCommitmentsNeedPOIs, ...unshieldEventsNeedPOIs].map((item) => item.txid);
+    return removeDuplicates(txids);
+  }
+
+  async getSpendableReceivedChainTxids(txidVersion: TXIDVersion, chain: Chain): Promise<string[]> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    const spendableTXOs = TXOs.filter(
+      (txo) => POI.getBalanceBucket(txo) === WalletBalanceBucket.Spendable,
+    );
+    const txids = spendableTXOs.map((item) => item.txid);
+    return removeDuplicates(txids);
+  }
+
   async refreshReceivePOIsAllTXOs(txidVersion: TXIDVersion, chain: Chain): Promise<void> {
     const TXOs = await this.TXOs(txidVersion, chain);
-    const txosNeedCreationPOIs = TXOs.filter((txo) => POI.shouldRetrieveCreationPOIs(txo)).sort(
-      (a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b),
+    const txosNeedCreationPOIs = TXOs.filter((txo) => POI.shouldRetrieveTXOPOIs(txo)).sort((a, b) =>
+      AbstractWallet.sortPOIsPerListUndefinedFirst(a, b),
     );
     if (txosNeedCreationPOIs.length === 0) {
       return;
     }
 
-    const blindedCommitmentDatas: BlindedCommitmentData[] = txosNeedCreationPOIs.map((txo) => ({
-      type: isSentCommitmentType(txo.commitmentType)
-        ? BlindedCommitmentType.Transact
-        : BlindedCommitmentType.Shield,
-      blindedCommitment: txo.blindedCommitment as string,
-    }));
+    const blindedCommitmentDatas: BlindedCommitmentData[] = txosNeedCreationPOIs
+      .slice(0, 100) // 100 max in request
+      .map((txo) => ({
+        type: isTransactCommitmentType(txo.commitmentType)
+          ? BlindedCommitmentType.Transact
+          : BlindedCommitmentType.Shield,
+        blindedCommitment: txo.blindedCommitment as string,
+      }));
     const blindedCommitmentToPOIList = await POI.retrievePOIsForBlindedCommitments(
       txidVersion,
       chain,
@@ -1072,6 +1242,37 @@ abstract class AbstractWallet extends EventEmitter {
     return isDefined(railgunTxid) ? item.railgunTxid === railgunTxid : true;
   }
 
+  async getSentCommitmentsAndUnshieldEventsNeedPOIRefresh(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    filterRailgunTxid?: string,
+  ) {
+    const [sentCommitments, TXOs] = await Promise.all([
+      this.getSentCommitments(txidVersion, chain, undefined),
+      this.TXOs(txidVersion, chain),
+    ]);
+    const sentCommitmentsNeedPOIRefresh = sentCommitments
+      .filter((sendCommitment) => POI.shouldRetrieveSentCommitmentPOIs(sendCommitment))
+      .filter((sentCommitment) =>
+        AbstractWallet.filterByRailgunTxid(sentCommitment, filterRailgunTxid),
+      )
+      .sort((a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b));
+
+    const unshieldEvents = await this.getUnshieldEventsFromSpentNullifiers(
+      txidVersion,
+      chain,
+      TXOs,
+    );
+    const unshieldEventsNeedPOIRefresh = unshieldEvents
+      .filter((unshieldEvent) => POI.shouldRetrieveUnshieldEventPOIs(unshieldEvent))
+      .filter((unshieldEvent) =>
+        AbstractWallet.filterByRailgunTxid(unshieldEvent, filterRailgunTxid),
+      )
+      .sort((a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b));
+
+    return { sentCommitmentsNeedPOIRefresh, unshieldEventsNeedPOIRefresh, TXOs };
+  }
+
   async getSentCommitmentsAndUnshieldEventsNeedPOIs(
     txidVersion: TXIDVersion,
     chain: Chain,
@@ -1082,7 +1283,7 @@ abstract class AbstractWallet extends EventEmitter {
       this.TXOs(txidVersion, chain),
     ]);
     const sentCommitmentsNeedPOIs = sentCommitments
-      .filter((sendCommitment) => POI.shouldRetrieveSpentPOIs(sendCommitment))
+      .filter((sendCommitment) => POI.shouldGenerateSpentPOIsSentCommitment(sendCommitment))
       .filter((sentCommitment) =>
         AbstractWallet.filterByRailgunTxid(sentCommitment, filterRailgunTxid),
       )
@@ -1100,7 +1301,13 @@ abstract class AbstractWallet extends EventEmitter {
       )
       .sort((a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b));
 
-    return { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs, TXOs };
+    return {
+      sentCommitments,
+      sentCommitmentsNeedPOIs,
+      unshieldEvents,
+      unshieldEventsNeedPOIs,
+      TXOs,
+    };
   }
 
   async refreshSpentPOIsAllSentCommitmentsAndUnshieldEvents(
@@ -1108,32 +1315,36 @@ abstract class AbstractWallet extends EventEmitter {
     chain: Chain,
     filterRailgunTxid?: string,
   ): Promise<void> {
-    const { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs } =
-      await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(txidVersion, chain, filterRailgunTxid);
-    if (!sentCommitmentsNeedPOIs.length && !unshieldEventsNeedPOIs.length) {
+    const { sentCommitmentsNeedPOIRefresh, unshieldEventsNeedPOIRefresh } =
+      await this.getSentCommitmentsAndUnshieldEventsNeedPOIRefresh(
+        txidVersion,
+        chain,
+        filterRailgunTxid,
+      );
+    if (!sentCommitmentsNeedPOIRefresh.length && !unshieldEventsNeedPOIRefresh.length) {
       return;
     }
 
     const blindedCommitmentDatas: BlindedCommitmentData[] = [
-      ...sentCommitmentsNeedPOIs.map((sentCommitment) => ({
-        type: isSentCommitmentType(sentCommitment.commitmentType)
+      ...sentCommitmentsNeedPOIRefresh.map((sentCommitment) => ({
+        type: isTransactCommitmentType(sentCommitment.commitmentType)
           ? BlindedCommitmentType.Transact
           : BlindedCommitmentType.Shield,
         blindedCommitment: sentCommitment.blindedCommitment as string,
       })),
-      ...unshieldEventsNeedPOIs.map((unshieldEvent) => ({
-        type: BlindedCommitmentType.Transact,
+      ...unshieldEventsNeedPOIRefresh.map((unshieldEvent) => ({
+        type: BlindedCommitmentType.Unshield,
         blindedCommitment: getBlindedCommitmentForUnshield(unshieldEvent.railgunTxid as string),
       })),
     ];
     const blindedCommitmentToPOIList = await POI.retrievePOIsForBlindedCommitments(
       txidVersion,
       chain,
-      blindedCommitmentDatas,
+      blindedCommitmentDatas.slice(0, 100), // 100 max in request
     );
 
     // eslint-disable-next-line no-restricted-syntax
-    for (const sentCommitment of sentCommitmentsNeedPOIs) {
+    for (const sentCommitment of sentCommitmentsNeedPOIRefresh) {
       if (!isDefined(sentCommitment.blindedCommitment)) {
         continue;
       }
@@ -1153,7 +1364,7 @@ abstract class AbstractWallet extends EventEmitter {
     const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
 
     // eslint-disable-next-line no-restricted-syntax
-    for (const unshieldEvent of unshieldEventsNeedPOIs) {
+    for (const unshieldEvent of unshieldEventsNeedPOIRefresh) {
       if (!isDefined(unshieldEvent.railgunTxid)) {
         continue;
       }
@@ -1171,20 +1382,25 @@ abstract class AbstractWallet extends EventEmitter {
     chain: Chain,
     txidVersion: TXIDVersion,
     railgunTxidFilter?: string,
-  ): Promise<void> {
+  ): Promise<number> {
     if (this.generatingPOIsForChain[chain.type]?.[chain.id]) {
-      return;
+      return 0;
     }
     this.generatingPOIsForChain[chain.type] ??= [];
     this.generatingPOIsForChain[chain.type][chain.id] = true;
 
     try {
-      const { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs, TXOs } =
-        await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(
-          txidVersion,
-          chain,
-          railgunTxidFilter,
-        );
+      const {
+        sentCommitments,
+        sentCommitmentsNeedPOIs,
+        unshieldEvents,
+        unshieldEventsNeedPOIs,
+        TXOs,
+      } = await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(
+        txidVersion,
+        chain,
+        railgunTxidFilter,
+      );
 
       if (!sentCommitmentsNeedPOIs.length && !unshieldEventsNeedPOIs.length) {
         if (isDefined(railgunTxidFilter)) {
@@ -1193,7 +1409,7 @@ abstract class AbstractWallet extends EventEmitter {
           );
         }
         this.generatingPOIsForChain[chain.type][chain.id] = false;
-        return;
+        return 0;
       }
 
       const railgunTxidsNeedPOIs = new Set<string>();
@@ -1219,49 +1435,246 @@ abstract class AbstractWallet extends EventEmitter {
 
       // eslint-disable-next-line no-restricted-syntax
       for (const railgunTxid of railgunTxids) {
-        const txidMerkletreeData = await txidMerkletree.getRailgunTxidCurrentMerkletreeData(
-          railgunTxid,
-        );
-        const { railgunTransaction } = txidMerkletreeData;
-
-        const isLegacyPOIProof = railgunTransaction.blockNumber < txidMerkletree.poiLaunchBlock;
-        const spentTXOs = TXOs.filter((txo) =>
-          railgunTransaction.nullifiers.includes(`0x${txo.nullifier}`),
-        );
-        const listKeys = POI.getListKeysCanGenerateSpentPOIs(spentTXOs, isLegacyPOIProof);
-        if (!listKeys.length) {
-          continue;
-        }
-
-        // eslint-disable-next-line no-restricted-syntax
-        for (const listKey of listKeys) {
-          // Use this syntax to capture each index and totalCount.
-          generatePOIsDatas.push({
+        try {
+          const txidMerkletreeData = await txidMerkletree.getRailgunTxidCurrentMerkletreeData(
             railgunTxid,
-            listKey,
-            isLegacyPOIProof,
+          );
+          const { railgunTransaction } = txidMerkletreeData;
+
+          const isLegacyPOIProof = railgunTransaction.blockNumber < txidMerkletree.poiLaunchBlock;
+          const spentTXOs = TXOs.filter((txo) =>
+            railgunTransaction.nullifiers.includes(`0x${txo.nullifier}`),
+          );
+
+          const sentCommitmentsForRailgunTxid = sentCommitments.filter(
+            (sentCommitment) => sentCommitment.railgunTxid === railgunTxid,
+          );
+          const unshieldEventsForRailgunTxid = unshieldEvents.filter(
+            (unshieldEvent) => unshieldEvent.railgunTxid === railgunTxid,
+          );
+
+          if (isDefined(railgunTransaction.unshield) && !unshieldEventsForRailgunTxid.length) {
+            continue;
+          }
+
+          const listKeys = POI.getListKeysCanGenerateSpentPOIs(
             spentTXOs,
-            txidMerkletreeData,
-            sentCommitments: sentCommitmentsNeedPOIs,
-            unshieldEvents: unshieldEventsNeedPOIs,
-          });
+            sentCommitmentsForRailgunTxid,
+            unshieldEventsForRailgunTxid,
+            isLegacyPOIProof,
+          );
+          if (!listKeys.length) {
+            continue;
+          }
+
+          // Make sure Spent TXOs are ordered, so the prover's NullifierCheck and MerkleProof validation will pass.
+          const orderedSpentTXOs = removeUndefineds(
+            railgunTransaction.nullifiers.map((nullifier) =>
+              spentTXOs.find((txo) => `0x${txo.nullifier}` === nullifier),
+            ),
+          );
+
+          // eslint-disable-next-line no-restricted-syntax
+          for (const listKey of listKeys) {
+            // Use this syntax to capture each index and totalCount.
+            generatePOIsDatas.push({
+              railgunTxid,
+              txid: railgunTransaction.txid,
+              listKey,
+              isLegacyPOIProof,
+              orderedSpentTXOs,
+              txidMerkletreeData,
+              sentCommitmentsForRailgunTxid,
+              unshieldEventsForRailgunTxid,
+            });
+          }
+        } catch (err) {
+          EngineDebug.log(`Skipping POI generation for railgunTxid: ${railgunTxid}`);
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+          EngineDebug.error(err);
+          // DO NOT THROW. Continue with next railgunTxid...
         }
       }
+
+      const generatePOIErrors: {
+        index: number;
+        errMessage: string;
+        generatePOIData: GeneratePOIsData;
+      }[] = [];
 
       // eslint-disable-next-line no-restricted-syntax
       for (let i = 0; i < generatePOIsDatas.length; i += 1) {
-        await this.generatePOIsForRailgunTxidAndListKey(
+        try {
+          await this.generatePOIsForRailgunTxidAndListKey(
+            txidVersion,
+            chain,
+            generatePOIsDatas[i],
+            i,
+            generatePOIsDatas.length,
+          );
+        } catch (err) {
+          // Capture error, but continue with all POIs. Throw the error after.
+          generatePOIErrors.push({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+            index: i,
+            errMessage: err.message,
+            generatePOIData: generatePOIsDatas[i],
+          });
+        }
+      }
+      this.generatingPOIsForChain[chain.type][chain.id] = false;
+
+      if (generatePOIErrors.length > 0) {
+        const { index, errMessage, generatePOIData } = generatePOIErrors[0];
+        const { listKey, railgunTxid, txid } = generatePOIData;
+        this.emitPOIProofUpdateEvent(
+          POIProofEventStatus.Error,
           txidVersion,
           chain,
-          generatePOIsDatas[i],
-          i,
+          0, // Progress
+          listKey,
+          txid,
+          railgunTxid,
+          index, // index
           generatePOIsDatas.length,
+          errMessage,
         );
+        throw generatePOIErrors[0];
       }
+
+      return generatePOIsDatas.length;
     } catch (err) {
       this.generatingPOIsForChain[chain.type][chain.id] = false;
       throw err;
     }
+  }
+
+  async generatePreTransactionPOI(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    listKey: string,
+    utxos: TXO[],
+    publicInputs: PublicInputsRailgun,
+    privateInputs: PrivateInputsRailgun,
+    boundParams: BoundParamsStruct,
+    progressCallback: (progress: number) => void,
+  ): Promise<{ txidLeafHash: string; preTransactionPOI: PreTransactionPOI }> {
+    const { commitmentsOut, nullifiers, boundParamsHash } = publicInputs;
+    const utxoTreeIn = BigInt(boundParams.treeNumber);
+
+    const globalTreePosition = getGlobalTreePositionPreTransactionPOIProof();
+
+    const railgunTxidBigInt = getRailgunTransactionIDFromBigInts(
+      nullifiers,
+      commitmentsOut,
+      boundParamsHash,
+    );
+    const txidLeafHash = getRailgunTxidLeafHash(
+      railgunTxidBigInt,
+      utxoTreeIn,
+      globalTreePosition,
+      txidVersion,
+    );
+    const railgunTxidHex = nToHex(railgunTxidBigInt, ByteLength.UINT_256);
+
+    const blindedCommitmentsIn = removeUndefineds(utxos.map((txo) => txo.blindedCommitment));
+    if (blindedCommitmentsIn.length !== nullifiers.length) {
+      throw new Error(
+        `Not enough UTXO blinded commitments for railgun transaction nullifiers: expected ${nullifiers.length}, got ${blindedCommitmentsIn.length}`,
+      );
+    }
+
+    const listPOIMerkleProofs: MerkleProof[] = await AbstractWallet.getListPOIMerkleProofs(
+      txidVersion,
+      chain,
+      listKey,
+      blindedCommitmentsIn,
+      false, // isLegacyPOIProof
+    );
+
+    const hasUnshield = BigInt(boundParams.unshield) !== 0n;
+    const railgunTxidIfHasUnshield = hasUnshield
+      ? getBlindedCommitmentForUnshield(railgunTxidHex)
+      : '0x00';
+
+    listPOIMerkleProofs.forEach((listMerkleProof, listMerkleProofIndex) => {
+      if (!verifyMerkleProof(listMerkleProof)) {
+        throw new Error(`Invalid list merkleproof: index ${listMerkleProofIndex}`);
+      }
+    });
+
+    const merkleProofForRailgunTxid = createDummyMerkleProof(txidLeafHash);
+    if (!verifyMerkleProof(merkleProofForRailgunTxid)) {
+      throw new Error('Invalid txid merkle proof');
+    }
+
+    const nonUnshieldCommitments = hasUnshield ? commitmentsOut.slice(0, -1) : commitmentsOut;
+    const blindedCommitmentsOut = nonUnshieldCommitments.map((commitment, i) => {
+      return getBlindedCommitmentForShieldOrTransact(
+        nToHex(commitment, ByteLength.UINT_256, true),
+        privateInputs.npkOut[i],
+        globalTreePosition + BigInt(i),
+      );
+    });
+
+    const poiMerkleroots = listPOIMerkleProofs.map((merkleProof) => merkleProof.root);
+
+    const poiProofInputs: POIEngineProofInputs = {
+      // --- Public inputs ---
+      anyRailgunTxidMerklerootAfterTransaction: merkleProofForRailgunTxid.root,
+
+      // --- Private inputs ---
+
+      // Railgun Transaction info
+      boundParamsHash: nToHex(boundParamsHash, ByteLength.UINT_256, true),
+      nullifiers: nullifiers.map((el) => nToHex(el, ByteLength.UINT_256, true)),
+      commitmentsOut: commitmentsOut.map((el) => nToHex(el, ByteLength.UINT_256, true)),
+
+      // Spender wallet info
+      spendingPublicKey: this.spendingPublicKey,
+      nullifyingKey: this.nullifyingKey,
+
+      // Nullified notes data
+      token: utxos[0].note.tokenHash,
+      randomsIn: utxos.map((txo) => txo.note.random),
+      valuesIn: utxos.map((txo) => txo.note.value),
+      utxoPositionsIn: utxos.map((txo) => txo.position),
+      utxoTreeIn: utxos[0].tree,
+
+      // Commitment notes data
+      npksOut: hasUnshield ? privateInputs.npkOut.slice(0, -1) : privateInputs.npkOut,
+      valuesOut: hasUnshield ? privateInputs.valueOut.slice(0, -1) : privateInputs.valueOut,
+      utxoTreeOut: GLOBAL_UTXO_TREE_PRE_TRANSACTION_POI_PROOF_HARDCODED_VALUE,
+      utxoBatchStartPositionOut: GLOBAL_UTXO_POSITION_PRE_TRANSACTION_POI_PROOF_HARDCODED_VALUE,
+      railgunTxidIfHasUnshield,
+
+      // Railgun txid tree
+      railgunTxidMerkleProofIndices: merkleProofForRailgunTxid.indices,
+      railgunTxidMerkleProofPathElements: merkleProofForRailgunTxid.elements,
+
+      // POI tree
+      poiMerkleroots,
+      poiInMerkleProofIndices: listPOIMerkleProofs.map((merkleProof) => merkleProof.indices),
+      poiInMerkleProofPathElements: listPOIMerkleProofs.map((merkleProof) => merkleProof.elements),
+    };
+
+    const { proof: snarkProof } = await this.prover.provePOI(
+      poiProofInputs,
+      listKey,
+      blindedCommitmentsIn,
+      blindedCommitmentsOut,
+      progressCallback,
+    );
+
+    const preTransactionPOI: PreTransactionPOI = {
+      snarkProof,
+      txidMerkleroot: merkleProofForRailgunTxid.root,
+      poiMerkleroots,
+      blindedCommitmentsOut,
+      railgunTxidIfHasUnshield,
+    };
+
+    return { txidLeafHash, preTransactionPOI };
   }
 
   private async generatePOIsForRailgunTxidAndListKey(
@@ -1275,21 +1688,29 @@ abstract class AbstractWallet extends EventEmitter {
       railgunTxid,
       listKey,
       isLegacyPOIProof,
-      spentTXOs,
+      orderedSpentTXOs,
       txidMerkletreeData,
-      sentCommitments,
-      unshieldEvents,
+      sentCommitmentsForRailgunTxid,
+      unshieldEventsForRailgunTxid,
     } = generatePOIsData;
+    const { railgunTransaction } = txidMerkletreeData;
 
     try {
-      const { railgunTransaction } = txidMerkletreeData;
       if (railgunTransaction.railgunTxid !== railgunTxid) {
         throw new Error('Invalid railgun transaction data for proof');
       }
 
+      EngineDebug.log(`Generating POI for RAILGUN transaction:`);
+      EngineDebug.log(stringifySafe(railgunTransaction));
+
       // Spent TXOs
-      const blindedCommitmentsIn = removeUndefineds(spentTXOs.map((txo) => txo.blindedCommitment));
+      const blindedCommitmentsIn = removeUndefineds(
+        orderedSpentTXOs.map((txo) => txo.blindedCommitment),
+      );
       if (blindedCommitmentsIn.length !== railgunTransaction.nullifiers.length) {
+        if (!orderedSpentTXOs.length) {
+          throw new Error(`No spent TXOs found for nullifier - data is likely still syncing.`);
+        }
         throw new Error(
           `Not enough TXO blinded commitments for railgun transaction nullifiers: expected ${railgunTransaction.nullifiers.length}, got ${blindedCommitmentsIn.length}`,
         );
@@ -1303,24 +1724,16 @@ abstract class AbstractWallet extends EventEmitter {
         isLegacyPOIProof,
       );
 
-      // Sent Commitments
-      const sentCommitmentsForRailgunTxid = sentCommitments.filter(
-        (sentCommitment) => sentCommitment.railgunTxid === railgunTxid,
-      );
-      const blindedCommitmentsOutSentCommitments = removeUndefineds(
-        sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.blindedCommitment),
-      );
-      // Unshield Events
-      const unshieldEventsForRailgunTxid = unshieldEvents.filter(
-        (unshieldEvent) => unshieldEvent.railgunTxid === railgunTxid,
-      );
       if (unshieldEventsForRailgunTxid.length > 1) {
         throw new Error('Cannot have more than 1 unshield event per railgun txid');
       }
 
       const hasUnshield = unshieldEventsForRailgunTxid.length > 0;
+      if (isDefined(railgunTransaction.unshield) !== hasUnshield) {
+        throw new Error(`Expected unshield railgun transaction to have matching unshield event`);
+      }
 
-      const commitmentsWithoutUnshields = hasUnshield
+      const numRailgunTransactionCommitmentsWithoutUnshields = hasUnshield
         ? railgunTransaction.commitments.length - 1
         : railgunTransaction.commitments.length;
 
@@ -1330,46 +1743,70 @@ abstract class AbstractWallet extends EventEmitter {
         : '0x00';
 
       if (!sentCommitmentsForRailgunTxid.length && !unshieldEventsForRailgunTxid.length) {
-        throw new Error(`No sent commitments or unshield events for railgun txid: ${railgunTxid}`);
-      }
-
-      // Aggregate Sent + Unshields
-      const blindedCommitmentsOut: string[] = removeDuplicates([
-        ...blindedCommitmentsOutSentCommitments,
-        // Do not send blinded commitments for unshields.
-      ]);
-      if (blindedCommitmentsOut.length !== commitmentsWithoutUnshields) {
         throw new Error(
-          `Not enough blinded commitments for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${blindedCommitmentsOut.length}`,
+          `No sent commitments w/ values or unshield events for railgun txid: ${railgunTxid}`,
         );
       }
 
-      const npksOut: bigint[] = [
-        ...sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.note.notePublicKey),
-        // Do not send npks for unshields
-      ];
-      if (npksOut.length !== commitmentsWithoutUnshields) {
+      // Do not send 'npks' for unshields. Send for all commitments (so they match the number of commitmentsOut - unshields).
+      const npksOut: bigint[] = sentCommitmentsForRailgunTxid.map(
+        (sentCommitment) => sentCommitment.note.notePublicKey,
+      );
+      if (npksOut.length !== numRailgunTransactionCommitmentsWithoutUnshields) {
         throw new Error(
-          `Invalid number of npksOut for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${npksOut.length}`,
+          `Invalid number of npksOut for transaction sent commitments: expected ${numRailgunTransactionCommitmentsWithoutUnshields}, got ${npksOut.length}`,
         );
       }
 
-      const valuesOut: bigint[] = [
-        ...sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.note.value),
-        // Do not send values for unshields
-      ];
-      if (valuesOut.length !== commitmentsWithoutUnshields) {
+      // Do not send 'values' for unshields. Send for all commitments (so they match the number of commitmentsOut - unshields).
+      const valuesOut: bigint[] = sentCommitmentsForRailgunTxid.map(
+        (sentCommitment) => sentCommitment.note.value,
+      );
+      if (valuesOut.length !== numRailgunTransactionCommitmentsWithoutUnshields) {
         throw new Error(
-          `Invalid number of valuesOut for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${valuesOut.length}`,
+          `Invalid number of valuesOut for transaction sent commitments: expected ${numRailgunTransactionCommitmentsWithoutUnshields}, got ${valuesOut.length}`,
+        );
+      }
+
+      // Do not send 'blinded commitments' for unshields. Send for all commitments. Zero out any with 0-values.
+      const blindedCommitmentsOut: string[] = removeUndefineds(
+        sentCommitmentsForRailgunTxid.map((sentCommitment) => {
+          if (sentCommitment.note.value === 0n) {
+            // Zero-out any 0-value commitment so this blindedCommitment matches the circuit.
+            return ZERO_32_BYTE_VALUE;
+          }
+          return sentCommitment.blindedCommitment;
+        }),
+      );
+      if (blindedCommitmentsOut.length !== numRailgunTransactionCommitmentsWithoutUnshields) {
+        throw new Error(
+          `Not enough blindedCommitments out for transaction sent commitments (ONLY with values): expected ${numRailgunTransactionCommitmentsWithoutUnshields}, got ${blindedCommitmentsOut.length}`,
         );
       }
 
       const anyRailgunTxidMerklerootAfterTransaction =
         txidMerkletreeData.currentMerkleProofForTree.root;
 
+      const merkleProofForRailgunTxid: MerkleProof = {
+        leaf: railgunTransaction.hash,
+        root: txidMerkletreeData.currentMerkleProofForTree.root,
+        indices: txidMerkletreeData.currentMerkleProofForTree.indices,
+        elements: txidMerkletreeData.currentMerkleProofForTree.elements,
+      };
+      if (!verifyMerkleProof(merkleProofForRailgunTxid)) {
+        throw new Error(
+          isLegacyPOIProof ? 'Invalid TXID merkleproof (snapshot)' : 'Invalid TXID merkleproof',
+        );
+      }
+      listPOIMerkleProofs.forEach((listMerkleProof, listMerkleProofIndex) => {
+        if (!verifyMerkleProof(listMerkleProof)) {
+          throw new Error(`Invalid list merkleproof: index ${listMerkleProofIndex}`);
+        }
+      });
+
       const poiProofInputs: POIEngineProofInputs = {
         // --- Public inputs ---
-        anyRailgunTxidMerklerootAfterTransaction,
+        anyRailgunTxidMerklerootAfterTransaction: merkleProofForRailgunTxid.root,
 
         // --- Private inputs ---
 
@@ -1383,11 +1820,11 @@ abstract class AbstractWallet extends EventEmitter {
         nullifyingKey: this.nullifyingKey,
 
         // Nullified notes data
-        token: spentTXOs[0].note.tokenHash,
-        randomsIn: spentTXOs.map((txo) => txo.note.random),
-        valuesIn: spentTXOs.map((txo) => txo.note.value),
-        utxoPositionsIn: spentTXOs.map((txo) => txo.position),
-        utxoTreeIn: spentTXOs[0].tree,
+        token: orderedSpentTXOs[0].note.tokenHash,
+        randomsIn: orderedSpentTXOs.map((txo) => txo.note.random),
+        valuesIn: orderedSpentTXOs.map((txo) => txo.note.value),
+        utxoPositionsIn: orderedSpentTXOs.map((txo) => txo.position),
+        utxoTreeIn: orderedSpentTXOs[0].tree,
 
         // Commitment notes data
         npksOut,
@@ -1397,8 +1834,8 @@ abstract class AbstractWallet extends EventEmitter {
         railgunTxidIfHasUnshield,
 
         // Railgun txid tree
-        railgunTxidMerkleProofIndices: txidMerkletreeData.currentMerkleProofForTree.indices,
-        railgunTxidMerkleProofPathElements: txidMerkletreeData.currentMerkleProofForTree.elements,
+        railgunTxidMerkleProofIndices: merkleProofForRailgunTxid.indices,
+        railgunTxidMerkleProofPathElements: merkleProofForRailgunTxid.elements,
 
         // POI tree
         poiMerkleroots: listPOIMerkleProofs.map((merkleProof) => merkleProof.root),
@@ -1411,9 +1848,11 @@ abstract class AbstractWallet extends EventEmitter {
       const { proof: snarkProof } = await this.prover.provePOI(
         poiProofInputs,
         listKey,
+        blindedCommitmentsIn,
         blindedCommitmentsOut,
         (progress: number) => {
           this.emitPOIProofUpdateEvent(
+            POIProofEventStatus.InProgress,
             txidVersion,
             chain,
             progress,
@@ -1422,6 +1861,7 @@ abstract class AbstractWallet extends EventEmitter {
             railgunTxid,
             index,
             totalCount,
+            undefined, // errorMsg
           );
         },
       );
@@ -1439,7 +1879,8 @@ abstract class AbstractWallet extends EventEmitter {
       );
     } catch (err) {
       // eslint-disable-next-line @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-member-access
-      throw new Error(`Error generating POI - txid ${railgunTxid}: ${err.message}`);
+      EngineDebug.error(new Error(`Error generating proof - txid ${railgunTxid}: ${err.message}`));
+      throw err;
     }
   }
 
@@ -1613,10 +2054,13 @@ abstract class AbstractWallet extends EventEmitter {
    * @param chain - chain type/id to get balances for
    * @returns history
    */
-  static getTransactionReceiveHistory(filteredTXOs: TXO[]): TransactionHistoryEntryReceived[] {
+  private static getTransactionReceiveHistory(
+    filteredTXOs: TXO[],
+  ): TransactionHistoryEntryReceived[] {
     const txidTransactionMap: { [txid: string]: TransactionHistoryEntryReceived } = {};
 
-    filteredTXOs.forEach(({ txid, timestamp, note }) => {
+    filteredTXOs.forEach((txo) => {
+      const { txid, timestamp, note } = txo;
       if (note.value === 0n) {
         return;
       }
@@ -1636,6 +2080,8 @@ abstract class AbstractWallet extends EventEmitter {
         memoText: note.memoText,
         senderAddress: note.getSenderAddress(),
         shieldFee: note.shieldFee,
+        balanceBucket: POI.getBalanceBucket(txo),
+        hasValidPOIForActiveLists: POI.hasValidPOIsActiveLists(txo.poisPerList),
       });
     });
 
@@ -1689,7 +2135,7 @@ abstract class AbstractWallet extends EventEmitter {
         // Nullifier exists. Find unshield events from txid.
 
         // NOTE: There are no Unshield events pre-V2.
-        const unshieldEventsForNullifier = await merkletree.getUnshieldEvents(spendtxid);
+        const unshieldEventsForNullifier = await merkletree.getAllUnshieldEventsForTxid(spendtxid);
         const filteredUnshieldEventsForNullifier = unshieldEventsForNullifier.filter(
           (event) =>
             unshieldEvents.find((existingUnshieldEvent) =>
@@ -1704,10 +2150,14 @@ abstract class AbstractWallet extends EventEmitter {
   }
 
   private static compareUnshieldEvents(a: UnshieldStoredEvent, b: UnshieldStoredEvent): boolean {
-    return a.txid === b.txid && a.eventLogIndex === b.eventLogIndex;
+    return (
+      a.txid === b.txid &&
+      (a.eventLogIndex === b.eventLogIndex ||
+        (isDefined(a.railgunTxid) && a.railgunTxid === b.railgunTxid))
+    );
   }
 
-  async getTransactionSpendHistory(
+  private async getTransactionSpendHistory(
     txidVersion: TXIDVersion,
     chain: Chain,
     filteredTXOs: TXO[],
@@ -1720,45 +2170,45 @@ abstract class AbstractWallet extends EventEmitter {
 
     const txidTransactionMap: { [txid: string]: TransactionHistoryEntryPreprocessSpent } = {};
 
-    sentCommitments.forEach(
-      ({ txid, timestamp, note, isLegacyTransactNote, noteAnnotationData }) => {
-        if (note.value === 0n) {
-          return;
-        }
-        if (!isDefined(txidTransactionMap[txid])) {
-          txidTransactionMap[txid] = {
-            txid,
-            timestamp,
-            blockNumber: note.blockNumber,
-            tokenAmounts: [],
-            unshieldEvents: [],
-            version: AbstractWallet.getTransactionHistoryItemVersion(
-              noteAnnotationData,
-              isLegacyTransactNote,
-            ),
-          };
-        }
-
-        const tokenHash = formatToByteLength(note.tokenHash, ByteLength.UINT_256, false);
-        const tokenAmount: TransactionHistoryTokenAmount | TransactionHistoryTransferTokenAmount = {
-          tokenHash,
-          tokenData: note.tokenData,
-          amount: note.value,
-          noteAnnotationData,
-          memoText: note.memoText,
+    sentCommitments.forEach((sentCommitment) => {
+      const { txid, timestamp, note, isLegacyTransactNote, noteAnnotationData } = sentCommitment;
+      if (note.value === 0n) {
+        return;
+      }
+      if (!isDefined(txidTransactionMap[txid])) {
+        txidTransactionMap[txid] = {
+          txid,
+          timestamp,
+          blockNumber: note.blockNumber,
+          tokenAmounts: [],
+          unshieldEvents: [],
+          version: AbstractWallet.getTransactionHistoryItemVersion(
+            noteAnnotationData,
+            isLegacyTransactNote,
+          ),
         };
-        const isNonLegacyTransfer =
-          !isLegacyTransactNote &&
-          isDefined(noteAnnotationData) &&
-          noteAnnotationData.outputType === OutputType.Transfer;
-        if (isNonLegacyTransfer) {
-          (tokenAmount as TransactionHistoryTransferTokenAmount).recipientAddress = encodeAddress(
-            note.receiverAddressData,
-          );
-        }
-        txidTransactionMap[txid].tokenAmounts.push(tokenAmount);
-      },
-    );
+      }
+
+      const tokenHash = formatToByteLength(note.tokenHash, ByteLength.UINT_256, false);
+      const tokenAmount: TransactionHistoryTokenAmount | TransactionHistoryTransferTokenAmount = {
+        tokenHash,
+        tokenData: note.tokenData,
+        amount: note.value,
+        noteAnnotationData,
+        memoText: note.memoText,
+        hasValidPOIForActiveLists: POI.hasValidPOIsActiveLists(sentCommitment.poisPerList),
+      };
+      const isNonLegacyTransfer =
+        !isLegacyTransactNote &&
+        isDefined(noteAnnotationData) &&
+        noteAnnotationData.outputType === OutputType.Transfer;
+      if (isNonLegacyTransfer) {
+        (tokenAmount as TransactionHistoryTransferTokenAmount).recipientAddress = encodeAddress(
+          note.receiverAddressData,
+        );
+      }
+      txidTransactionMap[txid].tokenAmounts.push(tokenAmount);
+    });
 
     // Add unshield events to txidTransactionMap
     allUnshieldEvents.forEach((unshieldEvent) => {
@@ -1807,9 +2257,13 @@ abstract class AbstractWallet extends EventEmitter {
             transferTokenAmounts.push(tokenAmount as TransactionHistoryTransferTokenAmount);
             return;
           }
+
           switch (tokenAmount.noteAnnotationData.outputType) {
             case OutputType.Transfer:
-              transferTokenAmounts.push(tokenAmount as TransactionHistoryTransferTokenAmount);
+              transferTokenAmounts.push(
+                // NOTE: recipientAddress is set during pre-process for all non-legacy Transfers.
+                tokenAmount as TransactionHistoryTransferTokenAmount,
+              );
               break;
             case OutputType.RelayerFee:
               relayerFeeTokenAmount = tokenAmount;
@@ -1836,6 +2290,7 @@ abstract class AbstractWallet extends EventEmitter {
               recipientAddress: unshieldEvent.toAddress,
               senderAddress: undefined,
               unshieldFee: unshieldEvent.fee,
+              hasValidPOIForActiveLists: POI.hasValidPOIsActiveLists(unshieldEvent.poisPerList),
             };
           },
         );
@@ -1873,17 +2328,19 @@ abstract class AbstractWallet extends EventEmitter {
     return merkletree;
   }
 
-  /**
-   * Gets wallet balances
-   * @param chain - chain type/id to get balances for
-   * @returns balances
-   */
-  async getAllBalances(chain: Chain): Promise<AllBalances> {
-    const balances: AllBalances = {};
+  async getTokenBalancesAllTxidVersions(
+    chain: Chain,
+    balanceBucketFilter: WalletBalanceBucket[],
+  ): Promise<TokenBalancesAllTxidVersions> {
+    const balances: TokenBalancesAllTxidVersions = {};
 
     // eslint-disable-next-line no-restricted-syntax
     for (const txidVersion of ACTIVE_TXID_VERSIONS) {
-      const balancesByTxidVersion = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
+      const TXOs = await this.TXOs(txidVersion, chain);
+      const balancesByTxidVersion = await AbstractWallet.getTokenBalancesByTxidVersion(
+        TXOs,
+        balanceBucketFilter,
+      );
 
       Object.keys(balancesByTxidVersion).forEach((tokenHash) => {
         balances[txidVersion] ??= {};
@@ -1894,16 +2351,61 @@ abstract class AbstractWallet extends EventEmitter {
     return balances;
   }
 
+  async getTokenBalances(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    onlySpendable: boolean,
+  ): Promise<TokenBalances> {
+    const balanceBucketFilter = onlySpendable
+      ? await POI.getSpendableBalanceBuckets(chain)
+      : Object.values(WalletBalanceBucket);
+    const TXOs = await this.TXOs(txidVersion, chain);
+    return AbstractWallet.getTokenBalancesByTxidVersion(TXOs, balanceBucketFilter);
+  }
+
+  async getTokenBalancesForUnshieldToOrigin(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    originShieldTxidForSpendabilityOverride?: string,
+  ): Promise<TokenBalances> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    return AbstractWallet.getTokenBalancesByTxidVersion(
+      TXOs,
+      [],
+      originShieldTxidForSpendabilityOverride,
+    );
+  }
+
+  async getTokenBalancesByBucket(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<Record<WalletBalanceBucket, TokenBalances>> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+
+    const balancesByBucket: Partial<Record<WalletBalanceBucket, TokenBalances>> = {};
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const balanceBucket of Object.values(WalletBalanceBucket)) {
+      const balanceBucketFilter = [balanceBucket];
+      balancesByBucket[balanceBucket] = await AbstractWallet.getTokenBalancesByTxidVersion(
+        TXOs,
+        balanceBucketFilter,
+      );
+    }
+
+    return balancesByBucket as Record<WalletBalanceBucket, TokenBalances>;
+  }
+
   /**
    * Gets wallet balances
    * @param chain - chain type/id to get balances for
    * @returns balances
    */
-  async getTokenBalancesByTxidVersion(
-    txidVersion: TXIDVersion,
-    chain: Chain,
+  static async getTokenBalancesByTxidVersion(
+    TXOs: TXO[],
+    balanceBucketFilter: WalletBalanceBucket[],
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<TokenBalances> {
-    const TXOs = await this.TXOs(txidVersion, chain);
     const tokenBalances: TokenBalances = {};
 
     // Loop through each TXO and add to balances if unspent
@@ -1918,13 +2420,39 @@ abstract class AbstractWallet extends EventEmitter {
         };
       }
 
-      // If utxo is unspent process it
-      if (txo.spendtxid === false) {
-        // Store utxo
-        tokenBalances[tokenHash].utxos.push(txo);
-        // Increment balance
-        tokenBalances[tokenHash].balance += txo.note.value;
+      const isSpent = txo.spendtxid !== false;
+      if (isSpent) {
+        return;
       }
+
+      const balanceBucket = POI.getBalanceBucket(txo);
+
+      if (isDefined(originShieldTxidForSpendabilityOverride)) {
+        // Only for Unshield-To-Origin transactions. Filter TXOs by the provided shield txid.
+        if (
+          !isShieldCommitmentType(txo.commitmentType) ||
+          formatToByteLength(txo.txid, ByteLength.UINT_256) !==
+            formatToByteLength(originShieldTxidForSpendabilityOverride, ByteLength.UINT_256)
+        ) {
+          // Skip if txid doesn't match.
+          return;
+        }
+      } else if (!balanceBucketFilter.includes(balanceBucket)) {
+        if (EngineDebug.isTestRun() && balanceBucket === WalletBalanceBucket.Spendable) {
+          // WARNING FOR TESTS ONLY
+          EngineDebug.error(
+            new Error(
+              'WARNING: Missing SPENDABLE balance - likely needs refreshPOIsForAllTXIDVersions before getting balance',
+            ),
+          );
+        }
+        return;
+      }
+
+      // Store utxo
+      tokenBalances[tokenHash].utxos.push(txo);
+      // Increment balance
+      tokenBalances[tokenHash].balance += txo.note.value;
     });
 
     return tokenBalances;
@@ -1934,8 +2462,10 @@ abstract class AbstractWallet extends EventEmitter {
     txidVersion: TXIDVersion,
     chain: Chain,
     tokenAddress: string,
+    balanceBucketFilter: WalletBalanceBucket[],
   ): Promise<Optional<bigint>> {
-    const balances = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
+    const TXOs = await this.TXOs(txidVersion, chain);
+    const balances = await AbstractWallet.getTokenBalancesByTxidVersion(TXOs, balanceBucketFilter);
     const tokenHash = getTokenDataHash(getTokenDataERC20(tokenAddress));
     const balanceForToken = balances[tokenHash];
     return isDefined(balanceForToken) ? balanceForToken.balance : undefined;
@@ -1949,9 +2479,16 @@ abstract class AbstractWallet extends EventEmitter {
   async getTotalBalancesByTreeNumber(
     txidVersion: TXIDVersion,
     chain: Chain,
+    balanceBucketFilter: WalletBalanceBucket[],
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<TotalBalancesByTreeNumber> {
-    // Fetch balances
-    const tokenBalances = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
+    const TXOs = await this.TXOs(txidVersion, chain);
+
+    const tokenBalances = await AbstractWallet.getTokenBalancesByTxidVersion(
+      TXOs,
+      balanceBucketFilter,
+      originShieldTxidForSpendabilityOverride,
+    );
 
     // Sort token balances by tree
     const totalBalancesByTreeNumber: TotalBalancesByTreeNumber = {};
@@ -1984,8 +2521,15 @@ abstract class AbstractWallet extends EventEmitter {
     txidVersion: TXIDVersion,
     chain: Chain,
     tokenHash: string,
+    balanceBucketFilter: WalletBalanceBucket[],
+    originShieldTxidForSpendabilityOverride?: string,
   ): Promise<TreeBalance[]> {
-    const totalBalancesByTreeNumber = await this.getTotalBalancesByTreeNumber(txidVersion, chain);
+    const totalBalancesByTreeNumber = await this.getTotalBalancesByTreeNumber(
+      txidVersion,
+      chain,
+      balanceBucketFilter,
+      originShieldTxidForSpendabilityOverride,
+    );
     const treeSortedBalances = totalBalancesByTreeNumber[tokenHash] ?? [];
     return treeSortedBalances;
   }
@@ -2003,12 +2547,16 @@ abstract class AbstractWallet extends EventEmitter {
     chain: Chain,
     progressCallback: Optional<(progress: number) => void>,
   ) {
-    EngineDebug.log(`scan wallet balances: chain ${chain.type}:${chain.id}`);
-
-    const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
-
-    // eslint-disable-next-line no-useless-catch
     try {
+      if (this.isClearingBalances[chain.type]?.[chain.id] === true) {
+        EngineDebug.log('Clearing balances... cannot scan wallet balances.');
+        return;
+      }
+
+      EngineDebug.log(`scan wallet balances: chain ${chain.type}:${chain.id}`);
+
+      const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
+
       if (txidVersion !== TXIDVersion.V2_PoseidonMerkle) {
         throw new Error('Wallet details will be incorrect for this TXID version - needs migration');
       }
@@ -2125,11 +2673,11 @@ abstract class AbstractWallet extends EventEmitter {
   /**
    * Occurs after balances are scanned.
    */
-  async refreshPOIsForAllTXIDVersions(chain: Chain) {
+  async refreshPOIsForAllTXIDVersions(chain: Chain, forceRefresh?: boolean) {
     if (!POI.isActiveForChain(chain)) {
       return;
     }
-    if (this.isRefreshingPOIs[chain.type]?.[chain.id]) {
+    if (forceRefresh !== true && this.isRefreshingPOIs[chain.type]?.[chain.id]) {
       return;
     }
     this.isRefreshingPOIs[chain.type] ??= [];
@@ -2141,21 +2689,74 @@ abstract class AbstractWallet extends EventEmitter {
         // Refresh POIs - Receive commitments
         await this.refreshReceivePOIsAllTXOs(txidVersion, chain);
 
+        // Submit POI events - Legacy received transact commitments
+        await this.submitLegacyTransactPOIEventsReceiveCommitments(txidVersion, chain);
+
         // Refresh POIs - Sent commitments / unshields
         await this.refreshSpentPOIsAllSentCommitmentsAndUnshieldEvents(txidVersion, chain);
 
-        // Generate POIs - Sent commitments / unshields
-        // TODO - add this after manual testing
-        // await this.generatePOIsAllSentCommitmentsAndUnshieldEvents(txidVersion, chain);
-      }
+        // Auto-generate POIs - Sent commitments / unshields
+        const numProofs = await this.generatePOIsAllSentCommitmentsAndUnshieldEvents(
+          chain,
+          txidVersion,
+        );
 
-      this.isRefreshingPOIs[chain.type][chain.id] = false;
+        this.isRefreshingPOIs[chain.type][chain.id] = false;
+        if (numProofs > 0) {
+          this.emitPOIProofUpdateEvent(
+            POIProofEventStatus.LoadingNextBatch,
+            txidVersion,
+            chain,
+            0, // Progress
+            'Loading...',
+            'N/A',
+            'N/A',
+            0,
+            0,
+            undefined, // errorMsg
+          );
+
+          // Retrigger
+          await this.refreshPOIsForAllTXIDVersions(chain);
+          return;
+        }
+
+        this.emitPOIProofUpdateEvent(
+          POIProofEventStatus.AllProofsCompleted,
+          txidVersion,
+          chain,
+          0, // Progress
+          'N/A',
+          'N/A',
+          'N/A',
+          0,
+          0,
+          undefined, // errorMsg
+        );
+      }
     } catch (err) {
       this.isRefreshingPOIs[chain.type][chain.id] = false;
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       EngineDebug.error(err, true /* ignoreInTests */);
       throw err;
     }
+  }
+
+  async generatePOIsForRailgunTxid(chain: Chain, txidVersion: TXIDVersion, railgunTxid: string) {
+    await this.generatePOIsAllSentCommitmentsAndUnshieldEvents(chain, txidVersion, railgunTxid);
+
+    this.emitPOIProofUpdateEvent(
+      POIProofEventStatus.AllProofsCompleted,
+      txidVersion,
+      chain,
+      0, // Progress
+      'N/A',
+      'N/A',
+      'N/A',
+      0,
+      0,
+      undefined, // errorMsg
+    );
   }
 
   /**
@@ -2214,11 +2815,13 @@ abstract class AbstractWallet extends EventEmitter {
    */
   async clearScannedBalances(txidVersion: TXIDVersion, chain: Chain) {
     const walletDetails = await this.getWalletDetails(txidVersion, chain);
-    this.cachedReceiveCommitments = [];
 
-    // Clear namespace and then resave the walletDetails
-    const namespace = this.getWalletDetailsPath(chain);
+    // Clear wallet namespace, including scanned TXOs and all details
+    const namespace = this.getWalletDBPrefix(chain);
+    this.isClearingBalances[chain.type] ??= [];
+    this.isClearingBalances[chain.type][chain.id] = true;
     await this.db.clearNamespace(namespace);
+    this.isClearingBalances[chain.type][chain.id] = false;
 
     walletDetails.treeScannedHeights = [];
     await this.db.put(this.getWalletDetailsPath(chain), msgpack.encode(walletDetails));

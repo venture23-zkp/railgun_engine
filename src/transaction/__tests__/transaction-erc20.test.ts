@@ -31,14 +31,15 @@ import { hashBoundParams } from '../bound-params';
 import { MEMO_SENDER_RANDOM_NULL, TXIDVersion } from '../../models';
 import WalletInfo from '../../wallet/wallet-info';
 import { TransactionBatch } from '../transaction-batch';
-import { getTokenDataERC20 } from '../../note/note-util';
+import { getTokenDataERC20, getTokenDataHashERC20 } from '../../note/note-util';
 import { TokenDataGetter } from '../../token/token-data-getter';
 import { ContractStore } from '../../contracts/contract-store';
 import { RailgunSmartWalletContract } from '../../contracts/railgun-smart-wallet/railgun-smart-wallet';
 import { BoundParamsStruct } from '../../abi/typechain/RailgunSmartWallet';
 import { PollingJsonRpcProvider } from '../../provider/polling-json-rpc-provider';
 import { UTXOMerkletree } from '../../merkletree/utxo-merkletree';
-import { AES } from '../../utils';
+import { AES, ZERO_32_BYTE_VALUE } from '../../utils';
+import { POI } from '../../poi/poi';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
@@ -104,7 +105,9 @@ describe('transaction-erc20', function test() {
     prover = new Prover(testArtifactsGetter);
     prover.setSnarkJSGroth16(groth16 as SnarkJSGroth16);
     address = wallet.addressKeys;
-    wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
+    await wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
+
+    POI.setLaunchBlock(chain, 0);
 
     // Load fake contract
     ContractStore.railgunSmartWalletContracts[chain.type] = [];
@@ -642,6 +645,7 @@ describe('transaction-erc20', function test() {
         txidVersion,
         testEncryptionKey,
         () => {},
+        false, // shouldGeneratePreTransactionPOIs
       ),
     ).to.eventually.be.rejectedWith('Can not add more than 4 outputs.');
 
@@ -662,7 +666,7 @@ describe('transaction-erc20', function test() {
     await expect(
       transactionBatch.generateValidSpendingSolutionGroupsAllOutputs(wallet, txidVersion),
     ).to.eventually.be.rejectedWith(
-      'RAILGUN private token balance too low for 0x000925cdf66ddf5b88016df1fe915e68eff8f192',
+      'RAILGUN spendable private balance too low for 0x000925cdf66ddf5b88016df1fe915e68eff8f192',
     );
 
     transactionBatch.resetOutputs();
@@ -670,7 +674,7 @@ describe('transaction-erc20', function test() {
     await expect(
       transactionBatch.generateValidSpendingSolutionGroupsAllOutputs(wallet, txidVersion),
     ).to.eventually.be.rejectedWith(
-      'RAILGUN private token balance too low for 0x5fbdb2315678afecb367f032d93f642f64180aa3',
+      'RAILGUN spendable private balance too low for 0x5fbdb2315678afecb367f032d93f642f64180aa3',
     );
 
     transactionBatch.resetOutputs();
@@ -678,7 +682,7 @@ describe('transaction-erc20', function test() {
     await expect(
       transactionBatch.generateValidSpendingSolutionGroupsAllOutputs(wallet, txidVersion),
     ).to.eventually.be.rejectedWith(
-      'RAILGUN private token balance too low for 0x5fbdb2315678afecb367f032d93f642f64180aa3',
+      'RAILGUN spendable private balance too low for 0x5fbdb2315678afecb367f032d93f642f64180aa3',
     );
 
     const transaction2 = new TransactionBatch(chain);
@@ -694,7 +698,7 @@ describe('transaction-erc20', function test() {
     await expect(
       transaction2.generateValidSpendingSolutionGroupsAllOutputs(wallet, txidVersion),
     ).to.eventually.be.rejectedWith(
-      'RAILGUN private token balance too low for 0x00000000000000000000000000000000000000ff',
+      'RAILGUN spendable private balance too low for 0x00000000000000000000000000000000000000ff',
     );
   });
 
@@ -725,12 +729,13 @@ describe('transaction-erc20', function test() {
 
   it('Should create transaction proofs and serialized transactions', async () => {
     transactionBatch.addOutput(await makeNote(1n));
-    const txs = await transactionBatch.generateTransactions(
+    const { provedTransactions: txs } = await transactionBatch.generateTransactions(
       prover,
       wallet,
       txidVersion,
       testEncryptionKey,
       () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
     expect(txs.length).to.equal(1);
     expect(txs[0].nullifiers.length).to.equal(1);
@@ -739,12 +744,13 @@ describe('transaction-erc20', function test() {
     transactionBatch.resetOutputs();
     transactionBatch.addOutput(await makeNote(1715000000000n));
 
-    const txs2 = await transactionBatch.generateTransactions(
+    const { provedTransactions: txs2 } = await transactionBatch.generateTransactions(
       prover,
       wallet,
       txidVersion,
       testEncryptionKey,
       () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
     expect(txs2.length).to.equal(1);
     expect(txs2[0].nullifiers.length).to.equal(1);
@@ -761,6 +767,7 @@ describe('transaction-erc20', function test() {
       (progress) => {
         loadProgress = progress;
       },
+      false, // shouldGeneratePreTransactionPOIs
     );
     expect(loadProgress).to.equal(100);
   });
@@ -776,6 +783,43 @@ describe('transaction-erc20', function test() {
     expect(txs.length).to.equal(1);
     expect(txs[0].nullifiers.length).to.equal(1);
     expect(txs[0].commitments.length).to.equal(2);
+  });
+
+  it('Should create dummy transaction proofs with origin shield txid', async () => {
+    transactionBatch.addOutput(await makeNote());
+
+    const tokenBalancesForUnshieldToOrigin = await wallet.getTokenBalancesForUnshieldToOrigin(
+      txidVersion,
+      chain,
+      '0xc97a2d06ceb87f81752bd58310e4aca822ae18a747e4dde752020e0b308a3aee',
+    );
+
+    expect(tokenBalancesForUnshieldToOrigin[getTokenDataHashERC20(tokenAddress)]?.balance).to.equal(
+      9975062344139650872817n, // 000000000000021cbfcc6fd98333b5f1
+    );
+
+    const txs = await transactionBatch.generateDummyTransactions(
+      prover,
+      wallet,
+      txidVersion,
+      testEncryptionKey,
+      '0xc97a2d06ceb87f81752bd58310e4aca822ae18a747e4dde752020e0b308a3aee', // originShieldTxidForSpendabilityOverride
+    );
+    expect(txs.length).to.equal(1);
+    expect(txs[0].nullifiers.length).to.equal(1);
+    expect(txs[0].commitments.length).to.equal(2);
+
+    await expect(
+      transactionBatch.generateDummyTransactions(
+        prover,
+        wallet,
+        txidVersion,
+        testEncryptionKey,
+        ZERO_32_BYTE_VALUE, // originShieldTxidForSpendabilityOverride
+      ),
+    ).to.be.rejectedWith(
+      'RAILGUN balance too low for 0x5fbdb2315678afecb367f032d93f642f64180aa3 from shield origin txid 0x0000000000000000000000000000000000000000000000000000000000000000. Amount required: 65000000000000000000. Amount available: 0.',
+    );
   });
 
   this.afterAll(async () => {

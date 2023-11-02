@@ -18,6 +18,7 @@ import { ProofCachePOI } from './proof-cache-poi';
 import { MERKLE_ZERO_VALUE_BIGINT } from '../models/merkletree-types';
 import { POIEngineProofInputs } from '../models';
 import { isDefined } from '../utils/is-defined';
+import { ProgressService } from './progress-service';
 
 const ZERO_VALUE_POI = MERKLE_ZERO_VALUE_BIGINT;
 
@@ -93,19 +94,70 @@ export class Prover {
     const suppressDebugLogger = { debug: () => {} };
 
     this.groth16 = {
-      fullProveRailgun: (
+      fullProveRailgun: async (
         formattedInputs: FormattedCircuitInputsRailgun,
         wasm: Optional<ArrayLike<number>>,
         zkey: ArrayLike<number>,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        _logger: { debug: (log: string) => void },
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        _dat: ArrayLike<number> | undefined,
+        progressCallback: ProverProgressCallback,
       ) => {
-        return snarkJSGroth16.fullProve(formattedInputs, wasm, zkey, suppressDebugLogger);
+        const progressService = new ProgressService(
+          0, // startValue
+          95, // endValue
+          1500, // totalMsec
+          250, // delayMsec
+        );
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        progressService.progressSteadily(progressCallback);
+        try {
+          const proof = await snarkJSGroth16.fullProve(
+            formattedInputs,
+            wasm,
+            zkey,
+            suppressDebugLogger,
+          );
+          progressService.stop();
+          return proof;
+        } catch (err) {
+          progressService.stop();
+          throw err;
+        }
       },
-      fullProvePOI: (
+      fullProvePOI: async (
         formattedInputs: FormattedCircuitInputsPOI,
         wasm: Optional<ArrayLike<number>>,
         zkey: ArrayLike<number>,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        _logger: { debug: (log: string) => void },
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        _dat: ArrayLike<number> | undefined,
+        progressCallback: ProverProgressCallback,
       ) => {
-        return snarkJSGroth16.fullProve(formattedInputs, wasm, zkey, suppressDebugLogger);
+        const progressService = new ProgressService(
+          0, // startValue
+          95, // endValue
+          3000, // totalMsec
+          250, // delayMsec
+        );
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        progressService.progressSteadily(progressCallback);
+
+        try {
+          const proof = await snarkJSGroth16.fullProve(
+            formattedInputs,
+            wasm,
+            zkey,
+            suppressDebugLogger,
+          );
+          progressService.stop();
+          return proof;
+        } catch (err) {
+          progressService.stop();
+          throw err;
+        }
       },
       verify: snarkJSGroth16.verify,
     };
@@ -416,6 +468,7 @@ export class Prover {
   async provePOI(
     inputs: POIEngineProofInputs,
     listKey: string,
+    blindedCommitmentsIn: string[],
     blindedCommitmentsOut: string[],
     progressCallback: ProverProgressCallback,
   ): Promise<{ proof: Proof; publicInputs: PublicInputsPOI }> {
@@ -424,6 +477,7 @@ export class Prover {
     return this.provePOIForInputsOutputs(
       inputs,
       listKey,
+      blindedCommitmentsIn,
       blindedCommitmentsOut,
       maxInputs,
       maxOutputs,
@@ -434,6 +488,7 @@ export class Prover {
   async provePOIForInputsOutputs(
     inputs: POIEngineProofInputs,
     listKey: string,
+    blindedCommitmentsIn: string[],
     blindedCommitmentsOut: string[],
     maxInputs: number,
     maxOutputs: number,
@@ -452,8 +507,17 @@ export class Prover {
       maxOutputs,
     );
 
-    const existingProof = ProofCachePOI.get(listKey, blindedCommitmentsOut);
-    if (existingProof) {
+    const existingProof = ProofCachePOI.get(
+      listKey,
+      inputs.anyRailgunTxidMerklerootAfterTransaction,
+      blindedCommitmentsOut,
+      inputs.poiMerkleroots,
+      inputs.railgunTxidIfHasUnshield,
+    );
+    if (
+      existingProof &&
+      (await this.verifyPOIProof(publicInputs, existingProof, maxInputs, maxOutputs))
+    ) {
       return { proof: existingProof, publicInputs };
     }
 
@@ -466,61 +530,84 @@ export class Prover {
 
     const formattedInputs = Prover.formatPOIInputs(inputs, maxInputs, maxOutputs);
 
-    // Generate proof: Progress from 20 - 99%
-    const initialProgressProof = 20;
-    const finalProgressProof = 99;
+    // Generate proof: Progress from 10 - 95%
+    const initialProgressProof = 10;
+    const finalProgressProof = 95;
     progressCallback(initialProgressProof);
 
-    const proofData = await this.groth16.fullProvePOI(
-      formattedInputs,
-      artifacts.wasm,
-      artifacts.zkey,
-      { debug: (msg: string) => EngineDebug.log(msg) },
-      artifacts.dat,
-      (progress: number) => {
-        progressCallback(
-          (progress * (finalProgressProof - initialProgressProof)) / 100 + initialProgressProof,
-        );
-      },
-    );
-    const { proof, publicSignals } = proofData;
-
-    if (isDefined(publicSignals)) {
-      // snarkjs will provide publicSignals for validation
-      for (let i = 0; i < blindedCommitmentsOut.length; i += 1) {
-        const blindedCommitmentOutString = publicInputs.blindedCommitmentsOut[i].toString();
-        if (blindedCommitmentOutString !== publicSignals[i]) {
-          throw new Error(
-            `Invalid blindedCommitmentOut value: expected ${publicSignals[i]}, got ${blindedCommitmentOutString}`,
+    try {
+      const proofData = await this.groth16.fullProvePOI(
+        formattedInputs,
+        artifacts.wasm,
+        artifacts.zkey,
+        { debug: (msg: string) => EngineDebug.log(msg) },
+        artifacts.dat,
+        (progress: number) => {
+          progressCallback(
+            (progress * (finalProgressProof - initialProgressProof)) / 100 + initialProgressProof,
           );
+        },
+      );
+      const { proof, publicSignals } = proofData;
+
+      if (isDefined(publicSignals)) {
+        // snarkjs will provide publicSignals for validation
+        for (let i = 0; i < blindedCommitmentsOut.length; i += 1) {
+          const blindedCommitmentOutString = publicInputs.blindedCommitmentsOut[i].toString();
+          if (blindedCommitmentOutString !== publicSignals[i]) {
+            throw new Error(
+              `Invalid blindedCommitmentOut value: expected ${publicSignals[i]}, got ${blindedCommitmentOutString}`,
+            );
+          }
         }
       }
+
+      progressCallback(finalProgressProof);
+
+      // For some reason, the proof returned by snarkjs contains extra fields.
+      // Trim them off.
+      const snarkProof: Proof = {
+        pi_a: [proof.pi_a[0], proof.pi_a[1]],
+        pi_b: [proof.pi_b[0], proof.pi_b[1]],
+        pi_c: [proof.pi_c[0], proof.pi_c[1]],
+      };
+
+      // Throw if proof is invalid
+      if (!(await this.verifyPOIProof(publicInputs, snarkProof, maxInputs, maxOutputs))) {
+        // eslint-disable-next-line no-console
+        throw new Error('POI proof verification failed');
+      }
+
+      ProofCachePOI.store(
+        listKey,
+        inputs.anyRailgunTxidMerklerootAfterTransaction,
+        blindedCommitmentsOut,
+        inputs.poiMerkleroots,
+        inputs.railgunTxidIfHasUnshield,
+        snarkProof,
+      );
+
+      progressCallback(100);
+
+      // Return proof with inputs
+      return {
+        proof: snarkProof,
+        publicInputs,
+      };
+    } catch (err) {
+      if (!(err instanceof Error)) {
+        throw err;
+      }
+
+      EngineDebug.log('Formatted POI proof inputs:');
+      EngineDebug.log(stringifySafe(formattedInputs));
+      EngineDebug.log('blindedCommitmentsIn');
+      EngineDebug.log(JSON.stringify(blindedCommitmentsIn));
+      EngineDebug.log('blindedCommitmentsOut');
+      EngineDebug.log(JSON.stringify(blindedCommitmentsOut));
+
+      throw new Error(`Unable to generate POI proof: ${err.message}`);
     }
-
-    progressCallback(finalProgressProof);
-
-    // For some reason, the proof returned by snarkjs contains extra fields.
-    // Trim them off.
-    const snarkProof: Proof = {
-      pi_a: [proof.pi_a[0], proof.pi_a[1]],
-      pi_b: [proof.pi_b[0], proof.pi_b[1]],
-      pi_c: [proof.pi_c[0], proof.pi_c[1]],
-    };
-
-    // Throw if proof is invalid
-    if (!(await this.verifyPOIProof(publicInputs, snarkProof, maxInputs, maxOutputs))) {
-      throw new Error('POI proof verification failed');
-    }
-
-    ProofCachePOI.store(listKey, blindedCommitmentsOut, snarkProof);
-
-    progressCallback(100);
-
-    // Return proof with inputs
-    return {
-      proof: snarkProof,
-      publicInputs,
-    };
   }
 
   static formatProof(proof: Proof): SnarkProof {

@@ -71,6 +71,7 @@ import { PollingJsonRpcProvider } from '../../../provider/polling-json-rpc-provi
 import { createPollingJsonRpcProviderForListeners } from '../../../provider/polling-util';
 import { isDefined } from '../../../utils/is-defined';
 import { TXIDVersion } from '../../../models/poi-types';
+import { WalletBalanceBucket } from '../../../models/txo-types';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
@@ -126,7 +127,7 @@ describe('railgun-smart-wallet', function runTests() {
       type: ChainType.EVM,
       id: Number((await provider.getNetwork()).chainId),
     };
-    const pollingProvider = await createPollingJsonRpcProviderForListeners(provider);
+    const pollingProvider = await createPollingJsonRpcProviderForListeners(provider, chain.id);
     await engine.loadNetwork(
       chain,
       config.contracts.proxy,
@@ -173,7 +174,9 @@ describe('railgun-smart-wallet', function runTests() {
 
       // Send shield on chain
       const tx = await sendTransactionWithLatestNonce(ethersWallet, shieldTx);
-      return (await Promise.all([tx.wait(), awaitScan(wallet, chain)]))[0];
+      const txReceipt = (await Promise.all([tx.wait(), awaitScan(wallet, chain)]))[0];
+      await wallet.refreshPOIsForAllTXIDVersions(chain, true);
+      return txReceipt;
     };
   });
 
@@ -263,12 +266,13 @@ describe('railgun-smart-wallet', function runTests() {
     // Submit actual transaction so the tree has a spent note/nullifier at position 0.
     const initialTransactionBatch = new TransactionBatch(chain);
     initialTransactionBatch.addOutput(actualRelayerFeeOutput);
-    const txs_initial = await initialTransactionBatch.generateTransactions(
+    const { provedTransactions: txs_initial } = await initialTransactionBatch.generateTransactions(
       engine.prover,
       wallet,
       txidVersion,
       testEncryptionKey,
       () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
     const tx_initial = await railgunSmartWalletContract.transact(txs_initial);
     const txTransact = await sendTransactionWithLatestNonce(ethersWallet, tx_initial);
@@ -276,6 +280,7 @@ describe('railgun-smart-wallet', function runTests() {
       txTransact.wait(),
       promiseTimeout(awaitMultipleScans(wallet, chain, 2), 15000, 'Timed out wallet1 scan'),
     ]);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
 
     // Case 1 - Dummy estimate with Null Relayer Fee
     const transactionBatch_DummyNullRelayerFee = new TransactionBatch(chain);
@@ -354,13 +359,15 @@ describe('railgun-smart-wallet', function runTests() {
     const transactionBatch_ActualTransaction = new TransactionBatch(chain);
     transactionBatch_ActualTransaction.addOutput(actualRelayerFeeOutput);
     transactionBatch_ActualTransaction.addOutput(nftTransferOutput);
-    const txs_ActualTransaction = await transactionBatch_ActualTransaction.generateTransactions(
-      engine.prover,
-      wallet,
-      txidVersion,
-      testEncryptionKey,
-      () => {},
-    );
+    const { provedTransactions: txs_ActualTransaction } =
+      await transactionBatch_ActualTransaction.generateTransactions(
+        engine.prover,
+        wallet,
+        txidVersion,
+        testEncryptionKey,
+        () => {},
+        false, // shouldGeneratePreTransactionPOIs
+      );
     expect(txs_ActualTransaction.length).to.equal(2);
     expect(txs_ActualTransaction.map((tx) => tx.nullifiers.length)).to.deep.equal([1, 1]);
     expect(txs_ActualTransaction.map((tx) => tx.commitments.length)).to.deep.equal([2, 1]);
@@ -527,12 +534,13 @@ describe('railgun-smart-wallet', function runTests() {
       value: 100n,
       tokenData,
     });
-    const serializedTxs = await transactionBatch.generateTransactions(
+    const { provedTransactions: serializedTxs } = await transactionBatch.generateTransactions(
       engine.prover,
       wallet,
       txidVersion,
       testEncryptionKey,
       () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
     const transact = await railgunSmartWalletContract.transact(serializedTxs);
 
@@ -543,13 +551,19 @@ describe('railgun-smart-wallet', function runTests() {
       promiseTimeout(awaitMultipleScans(wallet, chain, 2), 15000, 'Timed out wallet1 scan'),
       promiseTimeout(awaitMultipleScans(viewOnlyWallet, chain, 2), 15000, 'Timed out wallet1 scan'),
     ]);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
+    await viewOnlyWallet.refreshPOIsForAllTXIDVersions(chain);
 
-    expect(await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(
-      109724999999999999999600n,
-    );
-    expect(await viewOnlyWallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(
-      109724999999999999999600n,
-    );
+    expect(
+      await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS, [
+        WalletBalanceBucket.Spendable,
+      ]),
+    ).equal(109724999999999999999600n);
+    expect(
+      await viewOnlyWallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS, [
+        WalletBalanceBucket.Spendable,
+      ]),
+    ).equal(109724999999999999999600n);
 
     // Event should have been scanned by automatic contract events:
 
@@ -610,6 +624,7 @@ describe('railgun-smart-wallet', function runTests() {
     // Send shield on chain
     const tx = await sendTransactionWithLatestNonce(ethersWallet, shieldTx);
     await Promise.all([tx.wait(), awaitScan(wallet, chain)]);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
 
     const transactionBatch = new TransactionBatch(chain);
 
@@ -620,12 +635,13 @@ describe('railgun-smart-wallet', function runTests() {
       value: 1097250000n, // 11 * 100000000 * 0.9975
       tokenData,
     });
-    const serializedTxs = await transactionBatch.generateTransactions(
+    const { provedTransactions: serializedTxs } = await transactionBatch.generateTransactions(
       engine.prover,
       wallet,
       txidVersion,
       testEncryptionKey,
       () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
     const transact = await railgunSmartWalletContract.transact(serializedTxs);
 
@@ -635,8 +651,13 @@ describe('railgun-smart-wallet', function runTests() {
       txTransact.wait(),
       promiseTimeout(awaitMultipleScans(wallet, chain, 2), 15000, 'Timed out wallet1 scan'),
     ]);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
 
-    expect(await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(0n);
+    expect(
+      await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS, [
+        WalletBalanceBucket.Spendable,
+      ]),
+    ).equal(0n);
 
     const history = await wallet.getTransactionHistory(chain, startingBlock);
 
@@ -651,6 +672,8 @@ describe('railgun-smart-wallet', function runTests() {
       memoText: undefined,
       senderAddress: undefined,
       shieldFee: '250000', // 100000000 * 0.0025
+      balanceBucket: WalletBalanceBucket.Spent,
+      hasValidPOIForActiveLists: true,
     };
 
     // Check first output: Shield (receive only).
@@ -686,6 +709,7 @@ describe('railgun-smart-wallet', function runTests() {
         memoText: undefined,
         senderAddress: undefined,
         unshieldFee: '2493750',
+        hasValidPOIForActiveLists: false,
       },
       {
         tokenData: getTokenDataERC20(TOKEN_ADDRESS),
@@ -695,6 +719,7 @@ describe('railgun-smart-wallet', function runTests() {
         memoText: undefined,
         senderAddress: undefined,
         unshieldFee: '249375', // 1097250000n * 1/11 * 0.9975
+        hasValidPOIForActiveLists: false,
       },
     ]);
   }).timeout(120000);
@@ -727,6 +752,8 @@ describe('railgun-smart-wallet', function runTests() {
     expect(await utxoMerkletree.getTreeLength(tree)).to.equal(0);
     expect(await engine.getStartScanningBlock(txidVersion, chain)).to.equal(0);
 
+    const forceRefresh = true;
+    await wallet.refreshPOIsForAllTXIDVersions(chain, forceRefresh);
     await engine.fullRescanUTXOMerkletreesAndWallets(chain);
     expect(await utxoMerkletree.getTreeLength(tree)).to.equal(1);
   });
@@ -771,6 +798,7 @@ describe('railgun-smart-wallet', function runTests() {
       promiseTimeout(awaitScan(wallet, chain), 5000),
       txResponse.wait(),
     ]);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
 
     // Check result
     expect(result.treeNumber).to.equal(0);
@@ -884,15 +912,15 @@ describe('railgun-smart-wallet', function runTests() {
     });
 
     // Create transact
-    const transact = await railgunSmartWalletContract.transact(
-      await transactionBatch.generateTransactions(
-        engine.prover,
-        wallet,
-        txidVersion,
-        testEncryptionKey,
-        () => {},
-      ),
+    const { provedTransactions } = await transactionBatch.generateTransactions(
+      engine.prover,
+      wallet,
+      txidVersion,
+      testEncryptionKey,
+      () => {},
+      false, // shouldGeneratePreTransactionPOIs
     );
+    const transact = await railgunSmartWalletContract.transact(provedTransactions);
 
     // Send transact on chain
     const txResponse = await sendTransactionWithLatestNonce(ethersWallet, transact);

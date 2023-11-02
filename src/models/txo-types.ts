@@ -7,6 +7,7 @@ export type TXO = {
   position: number;
   txid: string;
   timestamp: Optional<number>;
+  blockNumber: number;
   spendtxid: string | false;
   nullifier: string;
   note: TransactNote;
@@ -14,6 +15,7 @@ export type TXO = {
   poisPerList: Optional<POIsPerList>;
   blindedCommitment: Optional<string>;
   commitmentType: CommitmentType;
+  transactCreationRailgunTxid: Optional<string>;
 };
 
 export type SentCommitment = {
@@ -64,6 +66,7 @@ export type TXOsSpentPOIStatusInfoShared = {
   txid: string;
   railgunTxid: string;
   railgunTransactionInfo: string;
+  poiStatusesSpentTXOs: Optional<POIsPerList>[];
   sentCommitmentsBlinded: string;
   poiStatusesSentCommitments: Optional<POIsPerList>[];
   unshieldEventsBlinded: string;
@@ -75,3 +78,13 @@ export type TXOsSpentPOIStatusInfo = {
   strings: TXOsSpentPOIStatusInfoShared;
   emojis: TXOsSpentPOIStatusInfoShared;
 };
+
+export enum WalletBalanceBucket {
+  Spendable = 'Spendable',
+  ShieldBlocked = 'ShieldBlocked',
+  ShieldPending = 'ShieldPending',
+  ProofSubmitted = 'ProofSubmitted',
+  MissingInternalPOI = 'MissingInternalPOI', // Change or DeFi interaction (Swap receipt)
+  MissingExternalPOI = 'MissingExternalPOI',
+  Spent = 'Spent', // ie. Unshielded To Origin
+}

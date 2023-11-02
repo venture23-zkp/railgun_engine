@@ -109,7 +109,7 @@ describe('transaction-batch', function run() {
 
     const provider = new PollingJsonRpcProvider(config.rpc, config.chainId, 500, 1);
 
-    const pollingProvider = await createPollingJsonRpcProviderForListeners(provider);
+    const pollingProvider = await createPollingJsonRpcProviderForListeners(provider, chain.id);
     await engine.loadNetwork(
       chain,
       config.contracts.proxy,
@@ -124,7 +124,7 @@ describe('transaction-batch', function run() {
     prover.setSnarkJSGroth16(groth16 as SnarkJSGroth16);
     address = wallet.addressKeys;
 
-    wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
+    await wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
     makeNote = async (value: bigint = 65n * DECIMALS_18): Promise<TransactNote> => {
       return TransactNote.createTransfer(
         address,
@@ -148,6 +148,7 @@ describe('transaction-batch', function run() {
     ]);
     await utxoMerkletree.updateTreesFromWriteQueue();
     await wallet.scanBalances(txidVersion, chain, undefined);
+    await wallet.refreshPOIsForAllTXIDVersions(chain, true);
     expect((await wallet.getWalletDetails(txidVersion, chain)).treeScannedHeights).to.deep.equal([
       1, 5,
     ]);
@@ -180,7 +181,7 @@ describe('transaction-batch', function run() {
     await expect(
       transactionBatch.generateDummyTransactions(prover, wallet, txidVersion, testEncryptionKey),
     ).to.eventually.be.rejectedWith(
-      `RAILGUN private token balance too low for ${tokenAddress.toLowerCase()}`,
+      `RAILGUN spendable private balance too low for ${tokenAddress.toLowerCase()}`,
     );
 
     transactionBatch.resetOutputs();
@@ -249,6 +250,7 @@ describe('transaction-batch', function run() {
         txidVersion,
         testEncryptionKey,
         () => {},
+        false, // shouldGeneratePreTransactionPOIs
       ),
     ).to.eventually.be.rejectedWith(
       'Cannot prove transaction with null (zero value) inputs and outputs.',
@@ -298,7 +300,7 @@ describe('transaction-batch', function run() {
     await expect(
       transactionBatch.generateDummyTransactions(prover, wallet, txidVersion, testEncryptionKey),
     ).to.eventually.be.rejectedWith(
-      `RAILGUN private token balance too low for ${tokenAddress.toLowerCase()}`,
+      `RAILGUN spendable private balance too low for ${tokenAddress.toLowerCase()}`,
     );
 
     transactionBatch.resetOutputs();

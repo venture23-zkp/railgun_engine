@@ -5,6 +5,7 @@ import levelup from 'levelup';
 import { BytesData, Ciphertext } from '../models/formatted-types';
 import { chunk, combine, hexlify } from '../utils/bytes';
 import { AES } from '../utils/encryption';
+import EngineDebug from '../debugger/debugger';
 
 export type Encoding =
   | 'utf8'
@@ -26,6 +27,8 @@ type Path = BytesData[];
 /** Database class */
 class Database {
   readonly level: LevelUp;
+
+  private isClearingNamespace: boolean = false;
 
   /**
    * Create a Database object from levelDB store
@@ -58,9 +61,25 @@ class Database {
    * @returns complete
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  put(path: Path, value: any, encoding: Encoding = 'hex'): Promise<void> {
-    const key = Database.pathToKey(path);
-    return this.level.put(key, value, { valueEncoding: encoding });
+  async put(path: Path, value: any, encoding: Encoding = 'hex'): Promise<void> {
+    try {
+      if (this.isClosed()) {
+        return;
+      }
+      if (this.isClearingNamespace) {
+        EngineDebug.log('Database is clearing a namespace - put action is dangerous');
+      }
+      const key = Database.pathToKey(path);
+      await this.level.put(key, value, { valueEncoding: encoding });
+    } catch (err) {
+      if (!(err instanceof Error)) {
+        return;
+      }
+      if (EngineDebug.isTestRun() && err.message.includes('Database is not open')) {
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -92,8 +111,24 @@ class Database {
    * @param encoding - data encoding to use
    * @returns complete
    */
-  batch(ops: AbstractBatch[], encoding: Encoding = 'hex'): Promise<void> {
-    return this.level.batch(ops, { valueEncoding: encoding });
+  async batch(ops: AbstractBatch[], encoding: Encoding = 'hex'): Promise<void> {
+    try {
+      if (this.isClosed()) {
+        return;
+      }
+      if (this.isClearingNamespace) {
+        EngineDebug.log('Database is clearing a namespace - batch action is dangerous');
+      }
+      await this.level.batch(ops, { valueEncoding: encoding });
+    } catch (err) {
+      if (!(err instanceof Error)) {
+        return;
+      }
+      if (EngineDebug.isTestRun() && err.message.includes('Database is not open')) {
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -165,11 +200,19 @@ class Database {
    * @returns complete
    */
   async clearNamespace(namespace: string[]): Promise<void> {
-    const pathkey = Database.pathToKey(namespace);
-    await this.level.clear({
-      gte: `${pathkey}`,
-      lte: `${pathkey}~`,
-    });
+    try {
+      this.isClearingNamespace = true;
+      const pathkey = Database.pathToKey(namespace);
+      EngineDebug.log(`Clearing namespace: ${pathkey}`);
+      await this.level.clear({
+        gte: `${pathkey}`,
+        lte: `${pathkey}~`,
+      });
+      this.isClearingNamespace = false;
+    } catch (err) {
+      this.isClearingNamespace = false;
+      throw err;
+    }
   }
 
   /**

@@ -56,7 +56,7 @@ export type UnshieldStoredEvent = {
   amount: string;
   fee: string;
   blockNumber: number;
-  eventLogIndex: number;
+  eventLogIndex: Optional<number>;
   railgunTxid: Optional<string>;
   poisPerList: Optional<POIsPerList>;
 };
@@ -86,7 +86,15 @@ export enum MerkletreeScanStatus {
   Incomplete = 'Incomplete',
 }
 
+export enum POIProofEventStatus {
+  LoadingNextBatch = 'LoadingNextBatch',
+  InProgress = 'InProgress',
+  Error = 'Error',
+  AllProofsCompleted = 'AllProofsCompleted',
+}
+
 export type POICurrentProofEventData = {
+  status: POIProofEventStatus;
   txidVersion: TXIDVersion;
   chain: Chain;
   progress: number;
@@ -95,4 +103,5 @@ export type POICurrentProofEventData = {
   railgunTxid: string;
   index: number;
   totalCount: number;
+  errorMsg: Optional<string>;
 };

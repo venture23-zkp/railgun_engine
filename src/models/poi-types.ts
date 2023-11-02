@@ -1,8 +1,9 @@
+import { Proof } from './prover-types';
+
 export enum TXOPOIListStatus {
   Valid = 'Valid',
   ShieldBlocked = 'ShieldBlocked',
-  ShieldPending = 'ShieldPending',
-  TransactProofSubmitted = 'TransactProofSubmitted',
+  ProofSubmitted = 'ProofSubmitted',
   Missing = 'Missing',
 }
 
@@ -14,12 +15,37 @@ export type POIsPerList = {
 export enum BlindedCommitmentType {
   Shield = 'Shield',
   Transact = 'Transact',
+  Unshield = 'Unshield',
 }
 
 export type BlindedCommitmentData = {
   blindedCommitment: string;
   type: BlindedCommitmentType;
 };
+
+export type LegacyTransactProofData = {
+  txidIndex: string;
+  npk: string;
+  value: string;
+  tokenHash: string;
+  blindedCommitment: string;
+};
+
+export type PreTransactionPOI = {
+  snarkProof: Proof;
+  txidMerkleroot: string;
+  poiMerkleroots: string[];
+  blindedCommitmentsOut: string[];
+  railgunTxidIfHasUnshield: string;
+};
+
+export type PreTransactionPOIsPerTxidLeafPerList = Record<
+  string, // listKey
+  Record<
+    string, // txidLeafHash
+    PreTransactionPOI
+  >
+>;
 
 export type POIEngineProofInputs = {
   // --- Public inputs ---
@@ -54,7 +80,7 @@ export type POIEngineProofInputs = {
   // Unshield data
   railgunTxidIfHasUnshield: string;
 
-  // Railgun txid tree
+  // Railgun txidIndex: string; tree
   railgunTxidMerkleProofIndices: string;
   railgunTxidMerkleProofPathElements: string[];
 

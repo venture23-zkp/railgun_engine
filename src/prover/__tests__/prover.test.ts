@@ -11,14 +11,15 @@ import { MerkleProof } from '../../models/formatted-types';
 import { TXIDVersion } from '../../models/poi-types';
 import { TXIDMerkletree } from '../../merkletree/txid-merkletree';
 import { Database } from '../../database/database';
-import { ShieldNote, TransactNote, getTokenDataHashERC20 } from '../../note';
+import { ShieldNote, TransactNote, getTokenDataERC20 } from '../../note';
 import { ByteLength, hexToBigInt, nToHex } from '../../utils';
 import { WalletNode } from '../../key-derivation/wallet-node';
 import { getGlobalTreePosition } from '../../poi/global-tree-position';
 import { getBlindedCommitmentForShieldOrTransact } from '../../poi/blinded-commitment';
-import { PublicInputsPOI } from '../../models';
+import { Proof, PublicInputsPOI } from '../../models';
 import { ProofCachePOI } from '../proof-cache-poi';
 import { config } from '../../test/config.test';
+import { POI } from '../../poi/poi';
 
 const chain: Chain = {
   type: 0,
@@ -28,6 +29,7 @@ const chain: Chain = {
 describe('prover', () => {
   beforeEach(() => {
     ProofCachePOI.clear_TEST_ONLY();
+    POI.setLaunchBlock(chain, 0);
   });
 
   it('Should generate and validate POI proof - 3x3', async () => {
@@ -41,8 +43,12 @@ describe('prover', () => {
     const { proof, publicInputs } = await prover.provePOI(
       testVector as any,
       testVector.listKey,
+      [], // blindedCommitmentsIn - just for logging
       testVector.blindedCommitmentsOut,
-      () => {}, // progress
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      (progress) => {
+        // console.log(progress);
+      },
     );
 
     expect(proof.pi_a.length).to.equal(2);
@@ -83,6 +89,7 @@ describe('prover', () => {
     const { proof, publicInputs } = await prover.provePOIForInputsOutputs(
       testVector as any,
       testVector.listKey,
+      [], // blindedCommitmentsIn - just for logging
       testVector.blindedCommitmentsOut,
       13, // maxInputs
       13, // maxOutputs
@@ -122,13 +129,18 @@ describe('prover', () => {
         boundParamsHash: testVector.boundParamsHash,
         commitments: testVector.commitmentsOut,
         nullifiers: testVector.nullifiers,
-        unshieldTokenHash: getTokenDataHashERC20(config.contracts.rail),
+        unshield: {
+          tokenData: getTokenDataERC20(config.contracts.rail),
+          toAddress: '0x1234',
+          value: '0x01',
+        },
+        timestamp: 1_000_000,
         txid: '00',
-        hasUnshield: true,
         blockNumber: 0,
         utxoTreeIn: 0,
         utxoTreeOut: 0,
         utxoBatchStartPositionOut: 1,
+        verificationHash: 'todo',
       },
       TXIDVersion.V2_PoseidonMerkle,
     );

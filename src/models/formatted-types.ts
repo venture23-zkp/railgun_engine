@@ -1,5 +1,5 @@
 import BN from 'bn.js';
-import { POIsPerList } from './poi-types';
+import { POIsPerList, TXIDVersion } from './poi-types';
 
 export type BytesData = ArrayLike<number> | string | BN;
 
@@ -154,11 +154,16 @@ export type RailgunTransaction = {
   boundParamsHash: string;
   blockNumber: number;
   txid: string;
-  unshieldTokenHash: Optional<string>;
-  hasUnshield: boolean;
+  unshield: Optional<{
+    tokenData: TokenData;
+    toAddress: string;
+    value: string;
+  }>;
   utxoTreeIn: number;
   utxoTreeOut: number;
   utxoBatchStartPositionOut: number;
+  timestamp: number;
+  verificationHash: string;
 };
 
 export type RailgunTransactionWithHash = RailgunTransaction & {
@@ -187,19 +192,23 @@ export type Nullifier = {
 
 // !! DO NOT MODIFY THIS TYPE - IT IS STORED IN DB WITH THESE EXACT KEYS !!
 export type StoredReceiveCommitment = {
+  txidVersion: TXIDVersion;
   spendtxid: string | false;
   txid: string;
   timestamp: Optional<number>;
   nullifier: string;
+  blockNumber: number;
   decrypted: NoteSerialized | LegacyNoteSerialized;
   senderAddress: Optional<string>;
   commitmentType: CommitmentType;
   poisPerList: Optional<POIsPerList>;
   blindedCommitment: Optional<string>;
+  transactCreationRailgunTxid: Optional<string>;
 };
 
 // !! DO NOT MODIFY THIS TYPE - IT IS STORED IN DB WITH THESE EXACT KEYS !!
 export type StoredSendCommitment = {
+  txidVersion: TXIDVersion;
   txid: string;
   timestamp: Optional<number>;
   decrypted: NoteSerialized | LegacyNoteSerialized;

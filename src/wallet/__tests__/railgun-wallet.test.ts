@@ -46,7 +46,7 @@ describe('railgun-wallet', () => {
       undefined, // creationBlockNumbers
       new Prover(testArtifactsGetter),
     );
-    wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
+    await wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
     viewOnlyWallet = await ViewOnlyWallet.fromShareableViewingKey(
       db,
       testEncryptionKey,
@@ -54,6 +54,7 @@ describe('railgun-wallet', () => {
       undefined, // creationBlockNumbers\
       new Prover(testArtifactsGetter),
     );
+    await viewOnlyWallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
   });
 
   it('Should load existing wallet', async () => {
@@ -192,95 +193,19 @@ describe('railgun-wallet', () => {
   });
 
   it('Should get empty wallet details', async () => {
-    expect(await wallet.getWalletDetails(txidVersion, chain)).to.deep.equal({
-      treeScannedHeights: [],
+    const walletDetails = await wallet.getWalletDetails(txidVersion, chain);
+    expect(walletDetails).to.deep.equal({
+      treeScannedHeights: [0],
       creationTree: undefined,
       creationTreeHeight: undefined,
     });
-    expect(await viewOnlyWallet.getWalletDetails(txidVersion, chain)).to.deep.equal({
-      treeScannedHeights: [],
+    const viewOnlyWalletDetails = await viewOnlyWallet.getWalletDetails(txidVersion, chain);
+    expect(viewOnlyWalletDetails).to.deep.equal({
+      treeScannedHeights: [0],
       creationTree: undefined,
       creationTreeHeight: undefined,
     });
   });
-
-  // it('Should scan ERC20 balances', async () => {
-  //   await merkletree.queueLeaves(0, 0, leaves);
-  // await merkletree.updateTreesFromWriteQueue();
-
-  //   const process = wallet.scanBalances(1);
-
-  //   // Should respect scan lock
-  //   wallet.scanBalances(1);
-  //   await process;
-
-  //   expect(await wallet.getWalletDetails(chain)).to.deep.equal({
-  //     treeScannedHeights: [5],
-  //     primaryHeight: 5,
-  //     changeHeight: 2,
-  //   });
-
-  //   await merkletree.queueLeaves(0, 6, leaves2);
-  // await merkletree.updateTreesFromWriteQueue();
-
-  //   await wallet.scanBalances(1);
-
-  //   expect(await wallet.getWalletDetails(chain)).to.deep.equal({
-  //     treeScannedHeights: [11],
-  //   });
-
-  //   const balances = await wallet.balances(1);
-
-  //   expect(
-  //     balances['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].utxos.length,
-  //   ).to.equal(12);
-
-  //   expect(
-  //     balances['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].balance,
-  //   ).to.equal(786420n);
-
-  //   await merkletree.nullify([
-  //     {
-  //       txid: '000001',
-  //       nullifier: '15f75defeb0075ee0e898acc70780d245ab1c19b33cfd2b855dd66faee94a5e0',
-  //       treeNumber: 0,
-  //     },
-  //   ]);
-
-  //   const balances2 = await wallet.balances(1);
-
-  //   expect(
-  //     balances2['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].utxos.length,
-  //   ).to.equal(11);
-
-  //   expect(
-  //     balances2['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].balance,
-  //   ).to.equal(720885n);
-
-  //   await merkletree.nullify([
-  //     {
-  //       txid: '000001',
-  //       nullifier: '1c3ba503ad9e144683649756ce1e9a919afb56d836988435c1528ea8942f286e',
-  //       treeNumber: 0,
-  //     },
-  //   ]);
-
-  //   const balances3 = await wallet.balances(1);
-
-  //   expect(
-  //     balances3['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].utxos.length,
-  //   ).to.equal(10);
-
-  //   expect(
-  //     balances3['0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'].balance,
-  //   ).to.equal(655350n);
-
-  //   expect(
-  //     (await wallet.balancesByTree(1))[
-  //       '0000000000000000000000007f4925cdf66ddf5b88016df1fe915e68eff8f192'
-  //     ][0].utxos.length,
-  //   ).to.equal(10);
-  // }).timeout(60000);
 
   afterEach(async () => {
     // Clean up database

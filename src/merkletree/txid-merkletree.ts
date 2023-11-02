@@ -17,6 +17,9 @@ import {
 import { ByteLength, formatToByteLength, fromUTF8String, hexlify, nToHex } from '../utils/bytes';
 import { isDefined } from '../utils';
 import { TXIDVersion } from '../models';
+import EngineDebug from '../debugger/debugger';
+import { verifyMerkleProof } from './merkle-proof';
+import { POI } from '../poi/poi';
 
 type POILaunchSnapshotNode = {
   hash: string;
@@ -51,6 +54,10 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
       : CommitmentProcessingGroupSize.XXXLarge;
 
     super(db, chain, txidVersion, merklerootValidator, commitmentProcessingGroupSize);
+
+    if (POI.getLaunchBlock(chain) !== poiLaunchBlock) {
+      throw new Error('POI launch block is invalid.');
+    }
 
     this.poiLaunchBlock = poiLaunchBlock;
 
@@ -114,16 +121,40 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     index: number,
   ): Promise<Optional<RailgunTransactionWithHash>> {
     try {
+      if (tree < 0 || index < 0) {
+        return undefined;
+      }
       return await this.getData(tree, index);
     } catch (err) {
+      EngineDebug.log('Error getting railgun transaction');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-member-access
+      EngineDebug.error(err);
       return undefined;
     }
+  }
+
+  async getGlobalUTXOTreePositionForRailgunTransactionCommitment(
+    tree: number,
+    index: number,
+    commitmentHash: string,
+  ) {
+    const railgunTransaction = await this.getRailgunTransaction(tree, index);
+    if (!railgunTransaction) {
+      throw new Error('Railgun transaction for tree/index not found');
+    }
+    const commitmentIndex = railgunTransaction.commitments
+      .map((c) => formatToByteLength(c, ByteLength.UINT_256))
+      .indexOf(formatToByteLength(commitmentHash, ByteLength.UINT_256));
+    if (commitmentIndex < 0) {
+      throw new Error('Could not find commitmentHash for RailgunTransaction');
+    }
+    return railgunTransaction.utxoBatchStartPositionOut + commitmentIndex;
   }
 
   async getRailgunTxidCurrentMerkletreeData(railgunTxid: string): Promise<TXIDMerkletreeData> {
     const txidIndex = await this.getTxidIndexByRailgunTxid(railgunTxid);
     if (!isDefined(txidIndex)) {
-      throw new Error('tree/index not found');
+      throw new Error(`tree/index not found: railgun txid ${railgunTxid}`);
     }
     const { tree, index } = Merkletree.getTreeAndIndexFromGlobalPosition(txidIndex);
     const railgunTransaction = await this.getRailgunTransaction(tree, index);
@@ -144,10 +175,13 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
         throw new Error('POI Launch snapshot not found');
       }
       const currentMerkleProofForTree = await this.getMerkleProofWithSnapshot(
-        snapshotLeaf.index,
+        snapshotLeaf,
         tree,
         index,
       );
+      if (!verifyMerkleProof(currentMerkleProofForTree)) {
+        throw new Error('Invalid merkle proof for snapshot');
+      }
       return {
         railgunTransaction,
         currentMerkleProofForTree,
@@ -156,6 +190,9 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     }
 
     const currentMerkleProofForTree = await this.getMerkleProof(tree, index);
+    if (!verifyMerkleProof(currentMerkleProofForTree)) {
+      throw new Error('Invalid merkle proof');
+    }
     const currentIndex = await this.getLatestIndexForTree(tree);
     const currentTxidIndexForTree = TXIDMerkletree.getGlobalPosition(tree, currentIndex);
     return {
@@ -166,17 +203,12 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
   }
 
   async getMerkleProofWithSnapshot(
-    snapshotLeafIndex: number,
+    snapshotLeaf: POILaunchSnapshotNode,
     tree: number,
     index: number,
   ): Promise<MerkleProof> {
-    // Fetch leaf
     const leaf = await this.getNodeHash(tree, 0, index);
 
-    const snapshotLeaf = await this.getPOILaunchSnapshotNode(0);
-    if (!isDefined(snapshotLeaf)) {
-      throw new Error('POI Launch snapshot not found');
-    }
     const rightmostIndices = TXIDMerkletree.getRightmostNonzeroIndices(snapshotLeaf.index);
 
     // Get indexes of path elements to fetch
@@ -191,13 +223,22 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     // Fetch path elements
     const elements = await Promise.all(
       elementsIndices.map(async (elementIndex, level) => {
-        if (elementIndex === rightmostIndices[level]) {
+        const snapshotIndexAtLevel = rightmostIndices[level];
+        if (elementIndex > snapshotIndexAtLevel) {
+          // Get snapshot node hash (exact value)
+          return this.zeros[level];
+        }
+
+        if (elementIndex === snapshotIndexAtLevel) {
+          // Get snapshot node hash (exact value)
           const node = await this.getPOILaunchSnapshotNode(level);
           if (!isDefined(node)) {
             throw new Error('POI Launch snapshot node not found');
           }
           return node.hash;
         }
+
+        // Get current node hash (always same as snapshot)
         return this.getNodeHash(tree, level, elementIndex);
       }),
     );
@@ -232,10 +273,9 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     return railgunTransaction.blockNumber < blockNumber;
   }
 
-  async getLatestGraphID(): Promise<Optional<string>> {
+  async getLatestRailgunTransaction(): Promise<Optional<RailgunTransactionWithHash>> {
     const { tree, index } = await this.getLatestTreeAndIndex();
-    const railgunTransaction = await this.getRailgunTransaction(tree, index);
-    return railgunTransaction?.graphID;
+    return this.getRailgunTransaction(tree, index);
   }
 
   async queueRailgunTransactions(
@@ -246,7 +286,6 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     let nextTree = latestTree;
     let nextIndex = latestIndex;
 
-    const commitmentsToRailgunTxidBatch: PutBatch[] = [];
     const railgunTxidIndexLookupBatch: PutBatch[] = [];
 
     for (let i = 0; i < railgunTransactionsWithTxids.length; i += 1) {
@@ -254,7 +293,7 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
       nextTree = tree;
       nextIndex = index;
       if (TXIDMerkletree.isOutOfBounds(nextTree, nextIndex, maxTxidIndex)) {
-        return;
+        break;
       }
 
       const railgunTransactionWithTxid = railgunTransactionsWithTxids[i];
@@ -276,10 +315,7 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
       });
     }
 
-    await Promise.all([
-      this.db.batch(commitmentsToRailgunTxidBatch),
-      this.db.batch(railgunTxidIndexLookupBatch, 'utf8'),
-    ]);
+    await this.db.batch(railgunTxidIndexLookupBatch, 'utf8');
   }
 
   static isOutOfBounds(tree: number, index: number, maxTxidIndex?: number) {
@@ -383,6 +419,13 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
     this.savedPOILaunchSnapshot = true;
   }
 
+  async clearLeavesForInvalidVerificationHash(numLeavesToClear: number): Promise<void> {
+    const { tree: latestTree, index: latestIndex } = await this.getLatestTreeAndIndex();
+    const latestTxidIndex = TXIDMerkletree.getGlobalPosition(latestTree, latestIndex);
+    const clearToTxidIndex = Math.max(-1, latestTxidIndex - numLeavesToClear);
+    await this.clearLeavesAfterTxidIndex(clearToTxidIndex);
+  }
+
   async clearLeavesAfterTxidIndex(txidIndex: number): Promise<void> {
     // Lock for updates
     this.lockUpdates = true;
@@ -473,6 +516,9 @@ export class TXIDMerkletree extends Merkletree<RailgunTransactionWithHash> {
       const { tree, index } = TXIDMerkletree.getTreeAndIndexFromGlobalPosition(txidIndex);
       return await this.getData(tree, index);
     } catch (err) {
+      EngineDebug.log('Error getting railgun txid index');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-member-access
+      EngineDebug.error(err);
       return undefined;
     }
   }

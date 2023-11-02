@@ -5,9 +5,21 @@ import { stringifySafe } from '../utils';
 export class ProofCachePOI {
   private static cache: Map<string, Proof> = new Map();
 
-  static get(listKey: string, blindedCommitmentsOut: string[]): Optional<Proof> {
+  static get(
+    listKey: string,
+    anyRailgunTxidMerklerootAfterTransaction: string,
+    blindedCommitmentsOut: string[],
+    poiMerkleroots: string[],
+    railgunTxidIfHasUnshield: string,
+  ): Optional<Proof> {
     try {
-      const stringified = stringifySafe([listKey, ...blindedCommitmentsOut]);
+      const stringified = stringifySafe([
+        listKey,
+        anyRailgunTxidMerklerootAfterTransaction,
+        ...blindedCommitmentsOut,
+        ...poiMerkleroots,
+        railgunTxidIfHasUnshield,
+      ]);
       return ProofCachePOI.cache.get(stringified);
     } catch (err) {
       if (err instanceof Error) {
@@ -17,9 +29,22 @@ export class ProofCachePOI {
     }
   }
 
-  static store(listKey: string, blindedCommitmentsOut: string[], proof: Proof) {
+  static store(
+    listKey: string,
+    anyRailgunTxidMerklerootAfterTransaction: string,
+    blindedCommitmentsOut: string[],
+    poiMerkleroots: string[],
+    railgunTxidIfHasUnshield: string,
+    proof: Proof,
+  ) {
     try {
-      const stringified = stringifySafe([listKey, ...blindedCommitmentsOut]);
+      const stringified = stringifySafe([
+        listKey,
+        anyRailgunTxidMerklerootAfterTransaction,
+        ...blindedCommitmentsOut,
+        ...poiMerkleroots,
+        railgunTxidIfHasUnshield,
+      ]);
       ProofCachePOI.cache.set(stringified, proof);
     } catch (err) {
       if (err instanceof Error) {

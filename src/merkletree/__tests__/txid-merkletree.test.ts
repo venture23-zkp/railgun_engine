@@ -8,13 +8,16 @@ import { Database } from '../../database/database';
 import { TXIDMerkletree } from '../txid-merkletree';
 import { RailgunTransaction, TXIDVersion } from '../../models';
 import {
+  calculateRailgunTransactionVerificationHash,
   createRailgunTransactionWithHash,
   getRailgunTransactionID,
 } from '../../transaction/railgun-txid';
 import { ByteLength, nToHex } from '../../utils/bytes';
 import { verifyMerkleProof } from '../merkle-proof';
-import { getTokenDataHashERC20 } from '../../note/note-util';
+import { getTokenDataERC20 } from '../../note/note-util';
 import { config } from '../../test/config.test';
+import { TREE_DEPTH } from '../../models/merkletree-types';
+import { POI } from '../../poi/poi';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
@@ -35,6 +38,8 @@ describe('txid-merkletree', () => {
   beforeEach(async () => {
     // Create database
     db = new Database(memdown());
+
+    POI.setLaunchBlock(chain, poiLaunchBlock);
 
     merkletreePOINode = await TXIDMerkletree.createForPOINode(
       db,
@@ -57,15 +62,20 @@ describe('txid-merkletree', () => {
   it('Should get Txid merkletree DB paths', async () => {
     type Vector = {
       chain: Chain;
+      poiLaunchBlock: number;
       treeNumber: number;
       level: number;
       index: number;
       result: string[];
     };
 
+    POI.setLaunchBlock({ type: ChainType.EVM, id: 0 }, 10);
+    POI.setLaunchBlock({ type: ChainType.EVM, id: 4 }, 11);
+
     const vectors: Vector[] = [
       {
         chain: { type: ChainType.EVM, id: 0 },
+        poiLaunchBlock: 10,
         treeNumber: 0,
         level: 1,
         index: 5,
@@ -80,6 +90,7 @@ describe('txid-merkletree', () => {
       },
       {
         chain: { type: ChainType.EVM, id: 4 },
+        poiLaunchBlock: 11,
         treeNumber: 2,
         level: 7,
         index: 10,
@@ -100,7 +111,7 @@ describe('txid-merkletree', () => {
           db,
           vector.chain,
           TXIDVersion.V2_PoseidonMerkle,
-          1,
+          vector.poiLaunchBlock,
         );
 
         expect(merkletreeVectorTest.getTreeDBPrefix(vector.treeNumber)).to.deep.equal(
@@ -130,25 +141,31 @@ describe('txid-merkletree', () => {
           nullifiers: ['0x03', '0x04'],
           boundParamsHash: '0x05',
           blockNumber: 0,
-          unshieldTokenHash: getTokenDataHashERC20(config.contracts.rail),
+          unshield: {
+            tokenData: getTokenDataERC20(config.contracts.rail),
+            toAddress: '0x1234',
+            value: '0x01',
+          },
+          timestamp: 1_000_000,
           txid: '00',
-          hasUnshield: true,
           utxoTreeIn: 0,
           utxoTreeOut: 0,
           utxoBatchStartPositionOut: 0,
+          verificationHash: 'test',
         },
         {
           graphID: '0x10',
           commitments: ['0x11', '0x12'],
           nullifiers: ['0x13', '0x14'],
           boundParamsHash: '0x15',
-          unshieldTokenHash: getTokenDataHashERC20(config.contracts.rail),
+          unshield: undefined,
+          timestamp: 1_000_000,
           txid: '00',
-          hasUnshield: true,
           blockNumber: 0,
           utxoTreeIn: 0,
           utxoTreeOut: 0,
           utxoBatchStartPositionOut: 2,
+          verificationHash: 'test',
         },
       ];
       const railgunTransactionsWithTxids = railgunTransactions.map((railgunTransaction) =>
@@ -164,6 +181,10 @@ describe('txid-merkletree', () => {
       expect(await merkletree.getRoot(0)).to.equal(
         '0a03b0bf8dc758a3d5dd7f6b8b1974a4b212a0080425740c92cbd0c860ebde33',
       );
+
+      expect(
+        await merkletree.getGlobalUTXOTreePositionForRailgunTransactionCommitment(0, 1, '0x12'),
+      ).to.equal(3);
 
       if (merkletree.shouldStoreMerkleroots) {
         expect(await merkletree.getHistoricalMerkleroot(0, 0)).to.equal(
@@ -199,13 +220,20 @@ describe('txid-merkletree', () => {
         boundParamsHash: railgunTransactions[0].boundParamsHash,
         blockNumber: railgunTransactions[0].blockNumber,
         hash: nToHex(hash, ByteLength.UINT_256),
-        hasUnshield: true,
-        unshieldTokenHash: '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+        unshield: {
+          tokenData: getTokenDataERC20(
+            '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+          ),
+          toAddress: '0x1234',
+          value: '0x01',
+        },
+        timestamp: 1_000_000,
         txid: '00',
         railgunTxid: '1f9639a75d9aa09f959fb0f347da9a3afcbb09851c5cb398100d1721b5ed4be6',
         utxoTreeIn: 0,
         utxoTreeOut: 0,
         utxoBatchStartPositionOut: 0,
+        verificationHash: 'test',
       });
 
       expect(
@@ -217,13 +245,20 @@ describe('txid-merkletree', () => {
         boundParamsHash: '0x05',
         blockNumber: 0,
         hash: '1d20db6208e429e0bdfa9ceef6cdb33493a3a9134b4ec6d620d6d2e7c2de37f9',
-        hasUnshield: true,
-        unshieldTokenHash: '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+        unshield: {
+          tokenData: getTokenDataERC20(
+            '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+          ),
+          toAddress: '0x1234',
+          value: '0x01',
+        },
+        timestamp: 1_000_000,
         txid: '00',
         railgunTxid: railgunTransactionsWithTxids[0].railgunTxid,
         utxoTreeIn: 0,
         utxoTreeOut: 0,
         utxoBatchStartPositionOut: 0,
+        verificationHash: 'test',
       });
 
       // Make sure new constructed tree inherits db values
@@ -231,7 +266,7 @@ describe('txid-merkletree', () => {
         db,
         chain,
         TXIDVersion.V2_PoseidonMerkle,
-        0,
+        poiLaunchBlock,
       );
       const treeLength2 = await merkletree2.getTreeLength(0);
       expect(treeLength2).to.equal(2);
@@ -242,26 +277,36 @@ describe('txid-merkletree', () => {
           commitments: ['0x0101', '0x0102'],
           nullifiers: ['0x0103', '0x0104'],
           boundParamsHash: '0x0105',
-          unshieldTokenHash: getTokenDataHashERC20(config.contracts.rail),
+          unshield: {
+            tokenData: getTokenDataERC20(config.contracts.rail),
+            toAddress: '0x1234',
+            value: '0x01',
+          },
+          timestamp: 1_000_000,
           txid: '00',
-          hasUnshield: true,
           blockNumber: 2,
           utxoTreeIn: 0,
           utxoTreeOut: 0,
           utxoBatchStartPositionOut: 4,
+          verificationHash: 'test',
         },
         {
           graphID: '0x13',
           commitments: ['0x0211', '0x0212'],
           nullifiers: ['0x0213', '0x0214'],
           boundParamsHash: '0x0215',
-          unshieldTokenHash: getTokenDataHashERC20(config.contracts.rail),
+          unshield: {
+            tokenData: getTokenDataERC20(config.contracts.rail),
+            toAddress: '0x1234',
+            value: '0x01',
+          },
+          timestamp: 1_000_000,
           txid: '00',
-          hasUnshield: true,
           blockNumber: 3, // Will be after POI Launch block
           utxoTreeIn: 0,
           utxoTreeOut: 0,
           utxoBatchStartPositionOut: 6,
+          verificationHash: 'test',
         },
       ];
       const moreRailgunTransactionsWithTxids = moreRailgunTransactions.map((railgunTransaction2) =>
@@ -298,13 +343,20 @@ describe('txid-merkletree', () => {
             boundParamsHash: '0x05',
             blockNumber: 0,
             hash: '1d20db6208e429e0bdfa9ceef6cdb33493a3a9134b4ec6d620d6d2e7c2de37f9',
-            hasUnshield: true,
-            unshieldTokenHash: '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+            unshield: {
+              tokenData: getTokenDataERC20(
+                '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+              ),
+              toAddress: '0x1234',
+              value: '0x01',
+            },
+            timestamp: 1_000_000,
             txid: '00',
             railgunTxid: '1f9639a75d9aa09f959fb0f347da9a3afcbb09851c5cb398100d1721b5ed4be6',
             utxoTreeIn: 0,
             utxoTreeOut: 0,
             utxoBatchStartPositionOut: 0,
+            verificationHash: 'test',
           },
           currentTxidIndexForTree: 2,
           currentMerkleProofForTree: {
@@ -340,6 +392,7 @@ describe('txid-merkletree', () => {
         const { root } = currentMerkletreeData.currentMerkleProofForTree;
         const currentRoot = await merkletree.getRoot(0);
         expect(root).to.not.equal(currentRoot);
+        expect(root).to.equal((await merkletree.getPOILaunchSnapshotNode(TREE_DEPTH))?.hash);
       } else {
         // merkleproof without POI Launch snapshot
         const currentMerkletreeData = await merkletree.getRailgunTxidCurrentMerkletreeData(
@@ -354,13 +407,20 @@ describe('txid-merkletree', () => {
             boundParamsHash: '0x05',
             blockNumber: 0,
             hash: '1d20db6208e429e0bdfa9ceef6cdb33493a3a9134b4ec6d620d6d2e7c2de37f9',
-            hasUnshield: true,
-            unshieldTokenHash: '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+            unshield: {
+              tokenData: getTokenDataERC20(
+                '0000000000000000000000009fe46736679d2d9a65f0992f2272de9f3c7fa6e0',
+              ),
+              toAddress: '0x1234',
+              value: '0x01',
+            },
+            timestamp: 1_000_000,
             txid: '00',
             railgunTxid: '1f9639a75d9aa09f959fb0f347da9a3afcbb09851c5cb398100d1721b5ed4be6',
             utxoTreeIn: 0,
             utxoTreeOut: 0,
             utxoBatchStartPositionOut: 0,
+            verificationHash: 'test',
           },
           currentTxidIndexForTree: 3,
           currentMerkleProofForTree: {
@@ -421,6 +481,9 @@ describe('txid-merkletree', () => {
       );
 
       await merkletree.clearLeavesAfterTxidIndex(0);
+
+      // expect(await merkletree.getRailgunTransaction(0, 1)).to.equal(undefined);
+      expect(await merkletree.getNodeHash(0, 0, 1)).to.equal(merkletree.zeros[0]);
 
       // Current tree root (1 element)
       expect(await merkletree.getRoot(0)).to.equal(
