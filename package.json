@@ -13,6 +13,8 @@
     "compile": "yarn clean && tsc",
     "compile-test": "yarn clean && tsc -p tsconfig.test.json",
     "prepack": "yarn && yarn compile",
+    "build": "yarn clean && tsc",
+    "prepare": "yarn build",
     "release": "mkdir -p release && npm pack && mv *.tgz ./release",
     "gen-typechain": "typechain --target ethers-v6 --out-dir ./src/abi/typechain ./src/abi/*.json",
     "gen-typechain-legacy": "typechain --target ethers-v6 --out-dir ./src/abi/typechain ./src/abi/legacy/*.json",
