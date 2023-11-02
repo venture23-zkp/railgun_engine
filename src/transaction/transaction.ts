@@ -1,13 +1,6 @@
 import { RailgunWallet } from '../wallet/railgun-wallet';
 import { Prover, ProverProgressCallback } from '../prover/prover';
-import {
-  ByteLength,
-  formatToByteLength,
-  hexlify,
-  hexToBigInt,
-  nToHex,
-  randomHex,
-} from '../utils/bytes';
+import { ByteLength, formatToByteLength, hexlify, hexToBigInt, nToHex } from '../utils/bytes';
 import { AdaptID, NFTTokenData, OutputType, TokenData, TokenType } from '../models/formatted-types';
 import { UnshieldFlag } from '../models/transaction-constants';
 import { getNoteBlindingKeys, getSharedSymmetricKey } from '../utils/keys-utils';
@@ -19,9 +12,9 @@ import { TransactNote } from '../note/transact-note';
 import {
   UnprovedTransactionInputs,
   Proof,
-  PublicInputs,
+  PublicInputsRailgun,
   RailgunTransactionRequest,
-  PrivateInputs,
+  PrivateInputsRailgun,
 } from '../models/prover-types';
 import {
   BoundParamsStruct,
@@ -36,6 +29,7 @@ import { UnshieldNoteNFT } from '../note/nft/unshield-note-nft';
 import { getTokenDataHash } from '../note';
 import { calculateTotalSpend } from '../solutions/utxos';
 import { isDefined } from '../utils/is-defined';
+import { TXIDVersion } from '../models';
 
 class Transaction {
   private readonly adaptID: AdaptID;
@@ -138,10 +132,11 @@ class Transaction {
    */
   async generateTransactionRequest(
     wallet: RailgunWallet,
+    txidVersion: TXIDVersion,
     encryptionKey: string,
     overallBatchMinGasPrice = 0n,
   ): Promise<RailgunTransactionRequest> {
-    const merkletree = wallet.merkletrees[this.chain.type][this.chain.id];
+    const merkletree = wallet.getUTXOMerkletree(txidVersion, this.chain);
     const merkleRoot = await merkletree.getRoot(this.spendingTree);
     const spendingKey = await wallet.getSpendingKeyPair(encryptionKey);
     const nullifyingKey = wallet.getNullifyingKey();
@@ -194,7 +189,6 @@ class Transaction {
         TransactNote.createTransfer(
           wallet.addressKeys, // Receiver
           wallet.addressKeys, // Sender
-          randomHex(16),
           change,
           this.tokenData,
           senderViewingKeys,
@@ -282,14 +276,14 @@ class Transaction {
       commitmentCiphertext,
     };
 
-    const publicInputs: PublicInputs = {
+    const publicInputs: PublicInputsRailgun = {
       merkleRoot: hexToBigInt(merkleRoot),
       boundParamsHash: hashBoundParams(boundParams),
       nullifiers,
       commitmentsOut: allOutputs.map((note) => note.hash),
     };
 
-    const privateInputs: PrivateInputs = {
+    const privateInputs: PrivateInputsRailgun = {
       tokenAddress: hexToBigInt(this.tokenHash),
       randomIn: utxos.map((utxo) => hexToBigInt(utxo.note.random)),
       valueIn: utxos.map((utxo) => utxo.note.value),
@@ -326,7 +320,7 @@ class Transaction {
 
     Transaction.assertCanProve(privateInputs);
 
-    const { proof } = await prover.prove(unprovedTransactionInputs, progressCallback);
+    const { proof } = await prover.proveRailgun(unprovedTransactionInputs, progressCallback);
 
     return Transaction.createTransactionStruct(
       proof,
@@ -348,7 +342,7 @@ class Transaction {
   ): Promise<TransactionStruct> {
     const { publicInputs, boundParams } = transactionRequest;
 
-    const dummyProof: Proof = prover.dummyProve(publicInputs);
+    const dummyProof: Proof = prover.dummyProveRailgun(publicInputs);
 
     return Transaction.createTransactionStruct(
       dummyProof,
@@ -358,7 +352,7 @@ class Transaction {
     );
   }
 
-  private static assertCanProve(privateInputs: PrivateInputs) {
+  private static assertCanProve(privateInputs: PrivateInputsRailgun) {
     if (
       privateInputs.valueIn.length === 1 &&
       privateInputs.valueOut.length === 1 &&
@@ -371,7 +365,7 @@ class Transaction {
 
   private static createTransactionStruct(
     proof: Proof,
-    publicInputs: PublicInputs,
+    publicInputs: PublicInputsRailgun,
     boundParams: BoundParamsStruct,
     unshieldPreimage: CommitmentPreimageStruct,
   ): TransactionStruct {

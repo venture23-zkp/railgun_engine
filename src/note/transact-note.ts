@@ -1,4 +1,4 @@
-import { poseidon, Signature } from 'circomlibjs';
+import { poseidon } from 'circomlibjs';
 import { AddressData, decodeAddress, encodeAddress } from '../key-derivation/bech32';
 import { ViewingKeyPair } from '../key-derivation/wallet-node';
 import {
@@ -10,7 +10,6 @@ import {
   TokenData,
   TokenType,
 } from '../models/formatted-types';
-import { PublicInputs } from '../models/prover-types';
 import { MEMO_SENDER_RANDOM_NULL } from '../models/transaction-constants';
 import { TokenDataGetter } from '../token/token-data-getter';
 import {
@@ -25,8 +24,8 @@ import {
   randomHex,
 } from '../utils/bytes';
 import { ciphertextToEncryptedRandomData, encryptedDataToCiphertext } from '../utils/ciphertext';
-import { aes } from '../utils/encryption';
-import { signEDDSA, unblindNoteKey } from '../utils/keys-utils';
+import { AES } from '../utils/encryption';
+import { unblindNoteKey } from '../utils/keys-utils';
 import { unblindNoteKeyLegacy } from '../utils/keys-utils-legacy';
 import { LEGACY_MEMO_METADATA_BYTE_CHUNKS, Memo } from './memo';
 import {
@@ -120,8 +119,9 @@ export class TransactNote {
     );
     this.tokenHash = getTokenDataHash(tokenData);
     this.notePublicKey = this.getNotePublicKey();
-    this.hash = this.getHash();
+    this.hash = TransactNote.getHash(this.notePublicKey, this.tokenHash, this.value);
     this.annotationData = annotationData;
+    this.outputType = outputType;
     this.memoText = memoText;
     this.shieldFee = shieldFee;
     this.blockNumber = blockNumber;
@@ -130,7 +130,6 @@ export class TransactNote {
   static createTransfer(
     receiverAddressData: AddressData,
     senderAddressData: Optional<AddressData>,
-    random: string,
     value: bigint,
     tokenData: TokenData,
     senderViewingKeys: ViewingKeyPair,
@@ -140,7 +139,9 @@ export class TransactNote {
   ): TransactNote {
     // See note at top of file.
     const shouldCreateSenderRandom = !showSenderAddressToRecipient;
-    const senderRandom = shouldCreateSenderRandom ? randomHex(15) : MEMO_SENDER_RANDOM_NULL;
+    const senderRandom = shouldCreateSenderRandom
+      ? TransactNote.getSenderRandom()
+      : MEMO_SENDER_RANDOM_NULL;
 
     const annotationData = Memo.createEncryptedNoteAnnotationData(
       outputType,
@@ -151,7 +152,7 @@ export class TransactNote {
     return new TransactNote(
       receiverAddressData,
       senderAddressData,
-      random,
+      TransactNote.getNoteRandom(),
       value,
       tokenData,
       annotationData,
@@ -165,7 +166,6 @@ export class TransactNote {
   static createERC721Transfer(
     receiverAddressData: AddressData,
     senderAddressData: Optional<AddressData>,
-    random: string,
     tokenData: NFTTokenData,
     senderViewingKeys: ViewingKeyPair,
     showSenderAddressToRecipient: boolean,
@@ -177,7 +177,6 @@ export class TransactNote {
     return TransactNote.createTransfer(
       receiverAddressData,
       senderAddressData,
-      random,
       ERC721_NOTE_VALUE,
       tokenData,
       senderViewingKeys,
@@ -190,7 +189,6 @@ export class TransactNote {
   static createERC1155Transfer(
     receiverAddressData: AddressData,
     senderAddressData: Optional<AddressData>,
-    random: string,
     tokenData: NFTTokenData,
     amount: bigint,
     senderViewingKeys: ViewingKeyPair,
@@ -203,7 +201,6 @@ export class TransactNote {
     return TransactNote.createTransfer(
       receiverAddressData,
       senderAddressData,
-      random,
       amount,
       tokenData,
       senderViewingKeys,
@@ -211,6 +208,14 @@ export class TransactNote {
       OutputType.Transfer,
       memoText,
     );
+  }
+
+  static getNoteRandom(): string {
+    return randomHex(16);
+  }
+
+  static getSenderRandom(): string {
+    return randomHex(15);
   }
 
   private getNotePublicKey(): bigint {
@@ -228,8 +233,8 @@ export class TransactNote {
    * Get note hash
    * @returns {bigint} hash
    */
-  private getHash(): bigint {
-    return poseidon([this.notePublicKey, hexToBigInt(this.tokenHash), this.value]);
+  static getHash(notePublicKey: bigint, tokenHash: string, value: bigint): bigint {
+    return poseidon([notePublicKey, hexToBigInt(tokenHash), value]);
   }
 
   /**
@@ -258,7 +263,7 @@ export class TransactNote {
     );
 
     const encodedMemoText = Memo.encodeMemoText(this.memoText);
-    const ciphertext = aes.gcm.encrypt(
+    const ciphertext = AES.encryptGCM(
       [
         nToHex(encodedMasterPublicKey, ByteLength.UINT_256),
         token,
@@ -319,9 +324,9 @@ export class TransactNote {
     };
 
     // Decrypt values
-    const decryptedValues = aes.gcm
-      .decrypt(fullCiphertext, sharedKey)
-      .map((value) => hexlify(value));
+    const decryptedValues = AES.decryptGCM(fullCiphertext, sharedKey).map((value) =>
+      hexlify(value),
+    );
 
     return this.noteFromDecryptedValues(
       currentWalletAddressData,
@@ -494,7 +499,7 @@ export class TransactNote {
     const memoField: string[] = chunk(this.annotationData).map((el) =>
       formatToByteLength(el, ByteLength.UINT_256, prefix),
     );
-    const randomCiphertext = aes.gcm.encrypt([random], viewingPrivateKey);
+    const randomCiphertext = AES.encryptGCM([random], viewingPrivateKey);
     const [ivTag, data] = ciphertextToEncryptedRandomData(randomCiphertext);
 
     return {
@@ -558,7 +563,7 @@ export class TransactNote {
     viewingPrivateKey: Uint8Array,
   ): TransactNote {
     const randomCiphertext = encryptedDataToCiphertext(noteData.encryptedRandom);
-    const decryptedRandom = aes.gcm.decrypt(randomCiphertext, viewingPrivateKey);
+    const decryptedRandom = AES.decryptGCM(randomCiphertext, viewingPrivateKey);
 
     const annotationDataChunked = isDefined(noteData.memoField)
       ? noteData.memoField.slice(0, LEGACY_MEMO_METADATA_BYTE_CHUNKS)
@@ -597,7 +602,7 @@ export class TransactNote {
     return new TransactNote(
       this.receiverAddressData,
       this.senderAddressData,
-      randomHex(16),
+      TransactNote.getNoteRandom(),
       value,
       this.tokenData,
       this.annotationData,
@@ -623,7 +628,7 @@ export class TransactNote {
     return new TransactNote(
       nullAddressData,
       undefined, // senderAddressData
-      randomHex(16),
+      TransactNote.getNoteRandom(),
       value,
       tokenData,
       '', // annotationData

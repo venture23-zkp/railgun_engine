@@ -3,8 +3,14 @@ import chai from 'chai';
 import chaiAsPromised from 'chai-as-promised';
 import memdown from 'memdown';
 import { groth16 } from 'snarkjs';
-import { testArtifactsGetter } from '../../../test/helper.test';
-import { Groth16 } from '../../../prover/prover';
+import {
+  mockGetLatestValidatedRailgunTxid,
+  mockQuickSyncEvents,
+  mockQuickSyncRailgunTransactions,
+  mockRailgunTxidMerklerootValidator,
+  testArtifactsGetter,
+} from '../../../test/helper.test';
+import { SnarkJSGroth16 } from '../../../prover/prover';
 import { Chain, ChainType } from '../../../models/engine-types';
 import { RailgunEngine } from '../../../railgun-engine';
 import { RailgunSmartWalletContract } from '../railgun-smart-wallet';
@@ -13,6 +19,7 @@ import { PollingJsonRpcProvider } from '../../../provider/polling-json-rpc-provi
 import { CommitmentEvent } from '../../../models/event-types';
 import { CommitmentType, Nullifier } from '../../../models/formatted-types';
 import { createPollingJsonRpcProviderForListeners } from '../../../provider/polling-util';
+import { TXIDVersion } from '../../../models/poi-types';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
@@ -31,10 +38,11 @@ const testHistoricalEventsForRange = async (startBlock: number, endBlock: number
     startBlock,
     endBlock,
     async () => startBlock,
-    async (event: CommitmentEvent) => {
+    async (txidVersion: TXIDVersion, event: CommitmentEvent) => {
       if (event.commitments.length < 1) {
         throw new Error('No parsed commitments found in event');
       }
+      expect(txidVersion).to.equal(TXIDVersion.V2_PoseidonMerkle);
       expect(event.txid).to.be.a('string');
       expect(event.blockNumber).to.be.a('number');
       expect(event.startPosition).to.be.a('number');
@@ -56,7 +64,8 @@ const testHistoricalEventsForRange = async (startBlock: number, endBlock: number
           break;
       }
     },
-    async (nullifier: Nullifier[]) => {
+    async (txidVersion: TXIDVersion, nullifier: Nullifier[]) => {
+      expect(txidVersion).to.equal(TXIDVersion.V2_PoseidonMerkle);
       if (nullifier.length) {
         expect(nullifier[0].blockNumber).to.be.a('number');
         expect(nullifier[0].nullifier).to.be.a('string');
@@ -73,20 +82,23 @@ const testHistoricalEventsForRange = async (startBlock: number, endBlock: number
   expect(foundNullifiers).to.be.greaterThanOrEqual(1);
 };
 
-describe('Railgun Smart Wallet - Live events', function runTests() {
+describe('railgun-smart-wallet-events', function runTests() {
   this.timeout(20000);
 
   beforeEach(async () => {
-    engine = new RailgunEngine(
+    engine = RailgunEngine.initForWallet(
       'Test RSW',
       memdown(),
       testArtifactsGetter,
-      undefined, // quickSync
+      mockQuickSyncEvents,
+      mockQuickSyncRailgunTransactions,
+      mockRailgunTxidMerklerootValidator,
+      mockGetLatestValidatedRailgunTxid,
       undefined, // engineDebugger
       undefined, // skipMerkletreeScans
     );
 
-    engine.prover.setSnarkJSGroth16(groth16 as Groth16);
+    engine.prover.setSnarkJSGroth16(groth16 as SnarkJSGroth16);
 
     provider = new PollingJsonRpcProvider('https://rpc.ankr.com/eth', 1, 100);
 
@@ -102,6 +114,7 @@ describe('Railgun Smart Wallet - Live events', function runTests() {
       fakeRelayAdaptContract,
       provider,
       pollingProvider,
+      { [TXIDVersion.V2_PoseidonMerkle]: 0 },
       0,
     );
     railgunSmartWalletContract = ContractStore.railgunSmartWalletContracts[chain.type][chain.id];

@@ -5,19 +5,20 @@ import { groth16 } from 'snarkjs';
 import { Wallet } from 'ethers';
 import { Commitment, CommitmentType, OutputType } from '../../models/formatted-types';
 import { Chain, ChainType } from '../../models/engine-types';
-import { randomHex } from '../../utils/bytes';
 import { config } from '../../test/config.test';
 import {
   DECIMALS_18,
   getEthersWallet,
-  mockQuickSync,
+  mockGetLatestValidatedRailgunTxid,
+  mockQuickSyncEvents,
+  mockQuickSyncRailgunTransactions,
+  mockRailgunTxidMerklerootValidator,
   testArtifactsGetter,
 } from '../../test/helper.test';
 import { Database } from '../../database/database';
 import { AddressData } from '../../key-derivation/bech32';
-import { MerkleTree } from '../../merkletree/merkletree';
 import { TransactNote } from '../../note/transact-note';
-import { Prover, Groth16 } from '../../prover/prover';
+import { Prover, SnarkJSGroth16 } from '../../prover/prover';
 import { RailgunWallet } from '../../wallet/railgun-wallet';
 import { TransactionBatch } from '../transaction-batch';
 import { getTokenDataERC20 } from '../../note/note-util';
@@ -25,12 +26,16 @@ import { RailgunEngine } from '../../railgun-engine';
 import { PollingJsonRpcProvider } from '../../provider/polling-json-rpc-provider';
 import { createPollingJsonRpcProviderForListeners } from '../../provider/polling-util';
 import { isDefined } from '../../utils/is-defined';
+import { UTXOMerkletree } from '../../merkletree/utxo-merkletree';
+import { TXIDVersion } from '../../models/poi-types';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
 
+const txidVersion = TXIDVersion.V2_PoseidonMerkle;
+
 let db: Database;
-let merkletree: MerkleTree;
+let utxoMerkletree: UTXOMerkletree;
 let wallet: RailgunWallet;
 let chain: Chain;
 let ethersWallet: Wallet;
@@ -43,7 +48,6 @@ const testEncryptionKey = config.encryptionKey;
 
 const tokenAddress = '0x5FbDB2315678afecb367f032d93F642f64180aa3';
 const tokenData = getTokenDataERC20(tokenAddress);
-const random = randomHex(16);
 
 let makeNote: (value?: bigint) => Promise<TransactNote>;
 
@@ -62,11 +66,13 @@ const shieldLeaf = (txid: string): Commitment => ({
     '0x118beef50353ab8512be871c0473e219',
   ] as [string, string],
   blockNumber: 0,
+  utxoTree: 0,
+  utxoIndex: 0,
 });
 
 const shieldValue = 9975062344139650872817n;
 
-describe('Transaction/Transaction Batch', function run() {
+describe('transaction-batch', function run() {
   this.timeout(120000);
   this.beforeAll(async () => {
     db = new Database(memdown());
@@ -74,13 +80,14 @@ describe('Transaction/Transaction Batch', function run() {
       type: ChainType.EVM,
       id: 1,
     };
-    merkletree = await MerkleTree.create(db, chain, async () => true);
+    utxoMerkletree = await UTXOMerkletree.create(db, chain, txidVersion, async () => true);
     wallet = await RailgunWallet.fromMnemonic(
       db,
       testEncryptionKey,
       testMnemonic,
       0,
       undefined, // creationBlockNumbers
+      new Prover(testArtifactsGetter),
     );
     ethersWallet = getEthersWallet(testMnemonic);
 
@@ -88,11 +95,14 @@ describe('Transaction/Transaction Batch', function run() {
       return;
     }
 
-    const engine = new RailgunEngine(
+    const engine = RailgunEngine.initForWallet(
       'Tx Batch Tests',
       memdown(),
       testArtifactsGetter,
-      mockQuickSync,
+      mockQuickSyncEvents,
+      mockQuickSyncRailgunTransactions,
+      mockRailgunTxidMerklerootValidator,
+      mockGetLatestValidatedRailgunTxid,
       undefined, // engineDebugger
       undefined, // skipMerkletreeScans
     );
@@ -106,19 +116,19 @@ describe('Transaction/Transaction Batch', function run() {
       config.contracts.relayAdapt,
       provider,
       pollingProvider,
-      0,
+      { [TXIDVersion.V2_PoseidonMerkle]: 0 },
+      1,
     );
 
     prover = engine.prover;
-    prover.setSnarkJSGroth16(groth16 as Groth16);
+    prover.setSnarkJSGroth16(groth16 as SnarkJSGroth16);
     address = wallet.addressKeys;
 
-    wallet.loadMerkletree(merkletree);
+    wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
     makeNote = async (value: bigint = 65n * DECIMALS_18): Promise<TransactNote> => {
       return TransactNote.createTransfer(
         address,
         undefined,
-        random,
         value,
         tokenData,
         wallet.getViewingKeyPair(),
@@ -127,18 +137,20 @@ describe('Transaction/Transaction Batch', function run() {
         undefined, // memoText
       );
     };
-    merkletree.rootValidator = () => Promise.resolve(true);
-    await merkletree.queueLeaves(0, 0, [shieldLeaf('a')]);
-    await merkletree.queueLeaves(1, 0, [
+    utxoMerkletree.merklerootValidator = () => Promise.resolve(true);
+    await utxoMerkletree.queueLeaves(0, 0, [shieldLeaf('a')]);
+    await utxoMerkletree.queueLeaves(1, 0, [
       shieldLeaf('b'),
       shieldLeaf('c'),
       shieldLeaf('d'),
       shieldLeaf('e'),
       shieldLeaf('f'),
     ]);
-    await merkletree.updateTrees();
-    await wallet.scanBalances(chain, undefined);
-    expect((await wallet.getWalletDetails(chain)).treeScannedHeights).to.deep.equal([1, 5]);
+    await utxoMerkletree.updateTreesFromWriteQueue();
+    await wallet.scanBalances(txidVersion, chain, undefined);
+    expect((await wallet.getWalletDetails(txidVersion, chain)).treeScannedHeights).to.deep.equal([
+      1, 5,
+    ]);
   });
 
   beforeEach(async () => {
@@ -152,7 +164,12 @@ describe('Transaction/Transaction Batch', function run() {
     }
 
     transactionBatch.addOutput(await makeNote(shieldValue * 6n));
-    const txs = await transactionBatch.generateDummyTransactions(prover, wallet, testEncryptionKey);
+    const txs = await transactionBatch.generateDummyTransactions(
+      prover,
+      wallet,
+      txidVersion,
+      testEncryptionKey,
+    );
     expect(txs.length).to.equal(2);
     expect(txs.map((tx) => tx.nullifiers.length)).to.deep.equal([1, 5]);
     expect(txs.map((tx) => tx.commitments.length)).to.deep.equal([1, 1]);
@@ -161,7 +178,7 @@ describe('Transaction/Transaction Batch', function run() {
     transactionBatch.addOutput(await makeNote(shieldValue * 6n));
     transactionBatch.addOutput(await makeNote(1n));
     await expect(
-      transactionBatch.generateDummyTransactions(prover, wallet, testEncryptionKey),
+      transactionBatch.generateDummyTransactions(prover, wallet, txidVersion, testEncryptionKey),
     ).to.eventually.be.rejectedWith(
       `RAILGUN private token balance too low for ${tokenAddress.toLowerCase()}`,
     );
@@ -176,6 +193,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs2 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs2.length).to.equal(6);
@@ -190,6 +208,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs3 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs3.length).to.equal(1);
@@ -206,6 +225,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs4 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs4.map((tx) => tx.nullifiers.length)).to.deep.equal([1, 5]);
@@ -223,7 +243,13 @@ describe('Transaction/Transaction Batch', function run() {
     transactionBatch.resetUnshieldData();
     transactionBatch.addOutput(await makeNote(0n));
     await expect(
-      transactionBatch.generateTransactions(prover, wallet, testEncryptionKey, () => {}),
+      transactionBatch.generateTransactions(
+        prover,
+        wallet,
+        txidVersion,
+        testEncryptionKey,
+        () => {},
+      ),
     ).to.eventually.be.rejectedWith(
       'Cannot prove transaction with null (zero value) inputs and outputs.',
       'Null input, null output notes should fail.',
@@ -250,6 +276,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs1 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs1.length).to.equal(2);
@@ -269,7 +296,7 @@ describe('Transaction/Transaction Batch', function run() {
       tokenData,
     });
     await expect(
-      transactionBatch.generateDummyTransactions(prover, wallet, testEncryptionKey),
+      transactionBatch.generateDummyTransactions(prover, wallet, txidVersion, testEncryptionKey),
     ).to.eventually.be.rejectedWith(
       `RAILGUN private token balance too low for ${tokenAddress.toLowerCase()}`,
     );
@@ -289,6 +316,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs2 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs2.length).to.equal(6);
@@ -303,8 +331,8 @@ describe('Transaction/Transaction Batch', function run() {
       shieldValue,
     ]);
 
-    await merkletree.queueLeaves(1, 0, [shieldLeaf('g'), shieldLeaf('h')]);
-    await merkletree.updateTrees();
+    await utxoMerkletree.queueLeaves(1, 0, [shieldLeaf('g'), shieldLeaf('h')]);
+    await utxoMerkletree.updateTreesFromWriteQueue();
     transactionBatch.resetOutputs();
     transactionBatch.resetUnshieldData();
     transactionBatch.addOutput(await makeNote(0n));
@@ -316,6 +344,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs3 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs3.length).to.equal(1);
@@ -336,6 +365,7 @@ describe('Transaction/Transaction Batch', function run() {
     const txs4 = await transactionBatch.generateDummyTransactions(
       prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
     );
     expect(txs4.length).to.equal(1);
@@ -350,7 +380,7 @@ describe('Transaction/Transaction Batch', function run() {
     }
 
     // Clean up database
-    wallet.unloadMerkletree(merkletree.chain);
+    wallet.unloadUTXOMerkletree(txidVersion, utxoMerkletree.chain);
     await db.close();
   });
 });

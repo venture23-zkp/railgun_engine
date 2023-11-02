@@ -6,7 +6,6 @@ import msgpack from 'msgpack-lite';
 import type { Database } from '../database/database';
 import {
   fromUTF8String,
-  numberify,
   hexlify,
   formatToByteLength,
   ByteLength,
@@ -15,56 +14,30 @@ import {
   arrayify,
 } from '../utils/bytes';
 import EngineDebug from '../debugger/debugger';
-import { BytesData, Commitment, MerkleProof, Nullifier } from '../models/formatted-types';
+import { BytesData, MerkleProof } from '../models/formatted-types';
 import { Chain } from '../models/engine-types';
 import { getChainFullNetworkID } from '../chain/chain';
-import { SNARK_PRIME } from '../utils/constants';
-import { keccak256 } from '../utils/hash';
-import { UnshieldStoredEvent } from '../models';
 import { isDefined } from '../utils/is-defined';
-
-// eslint-disable-next-line no-unused-vars
-export type RootValidator = (tree: number, root: string) => Promise<boolean>;
-
-const TREE_DEPTH = 16;
-
-type TreeMetadata = {
-  scannedHeight: number;
-  invalidMerklerootDetails: InvalidMerklerootDetails | null;
-};
-export type MerkletreesMetadata = {
-  trees: { [tree: number]: TreeMetadata };
-};
-
-// Calculate tree zero value
-export const MERKLE_ZERO_VALUE: string = formatToByteLength(
-  numberify(keccak256(fromUTF8String('Railgun')))
-    .mod(SNARK_PRIME)
-    .toString('hex'),
-  ByteLength.UINT_256,
-);
+import {
+  InvalidMerklerootDetails,
+  MERKLE_ZERO_VALUE,
+  MerkletreeLeaf,
+  MerkletreesMetadata,
+  MerklerootValidator,
+  TREE_DEPTH,
+  CommitmentProcessingGroupSize,
+  TREE_MAX_ITEMS,
+} from '../models/merkletree-types';
+import { TXIDVersion } from '../models';
 
 const INVALID_MERKLE_ROOT_ERROR_MESSAGE = 'Cannot insert leaves. Invalid merkle root.';
 
-type InvalidMerklerootDetails = {
-  position: number;
-  blockNumber: number;
-};
+export abstract class Merkletree<T extends MerkletreeLeaf> {
+  protected abstract readonly merkletreePrefix: string;
 
-// Optimization: process leaves for a many commitment groups before checking merkleroot against contract.
-// If merkleroot is invalid, scan leaves as medium batches, and individually as a final backup.
-enum CommitmentProcessingGroupSize {
-  XXXLarge = 8000,
-  XXLarge = 1600,
-  XLarge = 800,
-  Large = 200,
-  Medium = 40,
-  Small = 10,
-  Single = 1,
-}
+  protected abstract readonly merkletreeType: string;
 
-class MerkleTree {
-  private db: Database;
+  protected readonly db: Database;
 
   readonly chain: Chain;
 
@@ -73,14 +46,16 @@ class MerkleTree {
   private treeLengths: number[] = [];
 
   // {tree: {startingIndex: [leaves]}}
-  private writeQueue: Commitment[][][] = [];
+  protected writeQueue: T[][][] = [];
+
+  protected lockUpdates = false;
+
+  txidVersion: TXIDVersion;
 
   // Check function to test if merkle root is valid
-  public rootValidator: RootValidator;
+  merklerootValidator: MerklerootValidator;
 
-  public trees: bigint[][];
-
-  public isScanning = false;
+  isScanning = false;
 
   private processingWriteQueueTrees: { [tree: number]: boolean } = {};
 
@@ -89,65 +64,63 @@ class MerkleTree {
   private cachedNodeHashes: { [tree: number]: { [level: number]: { [index: number]: string } } } =
     {};
 
+  private defaultCommitmentProcessingSize: CommitmentProcessingGroupSize;
+
   /**
-   * Create MerkleTree controller from database
+   * Create Merkletree controller from database
    * @param db - database object to use
    * @param chain - Chain type/id
-   * @param rootValidator - root validator callback
+   * @param merklerootValidator - root validator callback
    */
-  private constructor(db: Database, chain: Chain, rootValidator: RootValidator) {
+  constructor(
+    db: Database,
+    chain: Chain,
+    txidVersion: TXIDVersion,
+    merklerootValidator: MerklerootValidator,
+    defaultCommitmentProcessingSize: CommitmentProcessingGroupSize,
+  ) {
     // Set passed values
     this.db = db;
     this.chain = chain;
-    this.trees = Array(TREE_DEPTH)
-      .fill(0)
-      .map(() => []);
-    this.rootValidator = rootValidator;
+    this.txidVersion = txidVersion;
+    this.merklerootValidator = merklerootValidator;
+    this.defaultCommitmentProcessingSize = defaultCommitmentProcessingSize;
 
     // Calculate zero values
     this.zeros[0] = MERKLE_ZERO_VALUE;
     for (let level = 1; level <= TREE_DEPTH; level += 1) {
-      this.zeros[level] = MerkleTree.hashLeftRight(this.zeros[level - 1], this.zeros[level - 1]);
+      this.zeros[level] = Merkletree.hashLeftRight(this.zeros[level - 1], this.zeros[level - 1]);
     }
   }
 
-  static async create(
-    db: Database,
-    chain: Chain,
-    rootValidator: RootValidator,
-  ): Promise<MerkleTree> {
-    const merkleTree = new MerkleTree(db, chain, rootValidator);
-    await merkleTree.getMetadataFromStorage();
-    return merkleTree;
+  protected async init(): Promise<void> {
+    await this.getMetadataFromStorage();
   }
 
   /**
    * Gets merkle proof for leaf
-   * @param tree - tree number
-   * @param index - index of leaf
-   * @returns Merkle proof
    */
   async getMerkleProof(tree: number, index: number): Promise<MerkleProof> {
     // Fetch leaf
     const leaf = await this.getNodeHash(tree, 0, index);
 
     // Get indexes of path elements to fetch
-    const elementsIndexes: number[] = [index ^ 1];
+    const elementsIndices: number[] = [index ^ 1];
 
     // Loop through each level and calculate index
-    while (elementsIndexes.length < TREE_DEPTH) {
+    while (elementsIndices.length < TREE_DEPTH) {
       // Shift right and flip last bit
-      elementsIndexes.push((elementsIndexes[elementsIndexes.length - 1] >> 1) ^ 1);
+      elementsIndices.push((elementsIndices[elementsIndices.length - 1] >> 1) ^ 1);
     }
 
     // Fetch path elements
     const elements = await Promise.all(
-      elementsIndexes.map((elementIndex, level) => this.getNodeHash(tree, level, elementIndex)),
+      elementsIndices.map((elementIndex, level) => this.getNodeHash(tree, level, elementIndex)),
     );
 
     // Convert index to bytes data, the binary representation is the indices of the merkle path
     // Pad to 32 bytes
-    const indices = hexlify(new BN(index));
+    const indices = nToHex(BigInt(index), ByteLength.UINT_256);
 
     // Fetch root
     const root = await this.getRoot(tree);
@@ -163,58 +136,83 @@ class MerkleTree {
 
   /**
    * Hash 2 elements together
-   * @param left - left element
-   * @param right - right element
-   * @returns hash
    */
   static hashLeftRight(left: string, right: string): string {
     return nToHex(poseidon([hexToBigInt(left), hexToBigInt(right)]), ByteLength.UINT_256);
   }
 
-  /**
-   * Construct DB prefix for all trees
-   * @returns database prefix
-   */
-  getChainDBPrefix(): string[] {
-    // DO NOT change this string.
-    const merkletreePrefix = fromUTF8String('merkletree-erc20');
+  private getTXIDVersionPrefix(): string {
+    switch (this.txidVersion) {
+      case TXIDVersion.V2_PoseidonMerkle:
+        return 'V2';
+      // case TXIDVersion.V3_PoseidonMerkle:
+      // return 'V3';
+      // case TXIDVersion.V3_KZG:
+      // throw new Error('KZG txid version not supported for merkletrees.');
+    }
+    throw new Error('Unrecognized txid version for merkletree');
+  }
 
-    return [merkletreePrefix, getChainFullNetworkID(this.chain)].map((el) =>
+  getMerkletreeDBPrefix(): string[] {
+    const merkletreePrefix = fromUTF8String(this.merkletreePrefix);
+    const txidVersionPrefix = fromUTF8String(this.getTXIDVersionPrefix());
+
+    return [merkletreePrefix, getChainFullNetworkID(this.chain), txidVersionPrefix].map((el) =>
       formatToByteLength(el, ByteLength.UINT_256),
     );
   }
 
   /**
    * Construct DB prefix from tree number
-   * @param tree - tree number
-   * @returns database prefix
    */
   getTreeDBPrefix(tree: number): string[] {
-    return [...this.getChainDBPrefix(), hexlify(new BN(tree))].map((el) =>
+    return [...this.getMerkletreeDBPrefix(), hexlify(new BN(tree))].map((el) =>
+      formatToByteLength(el, ByteLength.UINT_256),
+    );
+  }
+
+  /**
+   * Construct node hash DB path from tree number and level
+   */
+  private getNodeHashLevelPath(tree: number, level: number): string[] {
+    return [...this.getTreeDBPrefix(tree), hexlify(new BN(level))].map((el) =>
       formatToByteLength(el, ByteLength.UINT_256),
     );
   }
 
   /**
    * Construct node hash DB path from tree number, level, and index
-   * @param tree - tree number
-   * @param level - merkle tree level
-   * @param index - node index
-   * @returns database path
    */
   getNodeHashDBPath(tree: number, level: number, index: number): string[] {
-    return [...this.getTreeDBPrefix(tree), hexlify(new BN(level)), hexlify(new BN(index))].map(
-      (el) => formatToByteLength(el, ByteLength.UINT_256),
-    );
+    const dbPath = [...this.getNodeHashLevelPath(tree, level), hexlify(new BN(index))];
+    return dbPath.map((el) => formatToByteLength(el, ByteLength.UINT_256));
+  }
+
+  async clearAllNodeHashes(tree: number): Promise<void> {
+    for (let level = 0; level < TREE_DEPTH; level += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.db.clearNamespace(this.getNodeHashLevelPath(tree, level));
+    }
+  }
+
+  static getGlobalPosition(tree: number, index: number): number {
+    return tree * TREE_MAX_ITEMS + index;
+  }
+
+  static getTreeAndIndexFromGlobalPosition(globalPosition: number): {
+    tree: number;
+    index: number;
+  } {
+    return {
+      tree: Math.floor(globalPosition / TREE_MAX_ITEMS),
+      index: globalPosition % TREE_MAX_ITEMS,
+    };
   }
 
   /**
-   * Construct commitments DB path from tree number, and index
-   * @param tree - tree number
-   * @param index - commitment index
-   * @returns database path
+   * Construct data DB path from tree number and index
    */
-  getCommitmentDBPath(tree: number, index: number): string[] {
+  getDataDBPath(tree: number, index: number): string[] {
     return [
       ...this.getTreeDBPrefix(tree),
       hexlify(new BN(0).notn(32)), // 2^32-1
@@ -222,104 +220,29 @@ class MerkleTree {
     ].map((el) => formatToByteLength(el, ByteLength.UINT_256));
   }
 
-  /**
-   * Construct DB path from nullifier
-   * @param tree - tree nullifier is for
-   * @param nullifier - nullifier to get path for
-   * @returns database path
-   */
-  getNullifierDBPath(tree: number, nullifier: string): string[] {
-    return [
-      ...this.getTreeDBPrefix(tree),
-      hexlify(new BN(0).notn(32).subn(1)), // 2^32-2
-      hexlify(nullifier),
-    ].map((el) => formatToByteLength(el, ByteLength.UINT_256));
-  }
-
-  /**
-   * Construct DB path from unshield transaction
-   * @param txid - unshield txid to get path for
-   * @returns database path
-   */
-  getUnshieldEventsDBPath(txid?: string, eventLogIndex?: number): string[] {
-    const path = [
-      ...this.getChainDBPrefix(),
-      hexlify(new BN(0).notn(32).subn(2)), // 2^32-3
-    ];
-    if (txid != null) {
-      path.push(hexlify(txid));
-    }
-    if (eventLogIndex != null) {
-      path.push(eventLogIndex.toString(16));
-    }
-    return path.map((el) => formatToByteLength(el, ByteLength.UINT_256));
-  }
-
-  /**
-   * Gets nullifier by its id
-   * @param {string} nullifier - nullifier to check
-   * @returns txid of spend transaction if spent, else undefined
-   */
-  async getStoredNullifierTxid(nullifier: string): Promise<Optional<string>> {
-    // Return if nullifier is set
-    let txid: Optional<string>;
-    const latestTree = await this.latestTree();
-    for (let tree = latestTree; tree >= 0; tree -= 1) {
-      try {
-        txid = (await this.db.get(this.getNullifierDBPath(tree, nullifier))) as string;
-        break;
-      } catch {
-        txid = undefined;
-      }
-    }
-    return txid;
-  }
-
-  /**
-   * Adds nullifiers to database
-   * @param nullifiers - nullifiers to add to db
-   */
-  async nullify(nullifiers: Nullifier[]): Promise<void> {
-    // Build write batch for nullifiers
-    const nullifierWriteBatch: PutBatch[] = nullifiers.map((nullifier) => ({
-      type: 'put',
-      key: this.getNullifierDBPath(nullifier.treeNumber, nullifier.nullifier).join(':'),
-      value: nullifier.txid,
-    }));
-
-    // Write to DB
-    return this.db.batch(nullifierWriteBatch);
-  }
-
-  /**
-   * Adds unshield event to database
-   * @param unshields - unshield events to add to db
-   */
-  async addUnshieldEvents(unshields: UnshieldStoredEvent[]): Promise<void> {
-    // Build write batch for nullifiers
-    const writeBatch: PutBatch[] = unshields.map((unshield) => ({
-      type: 'put',
-      key: this.getUnshieldEventsDBPath(unshield.txid, unshield.eventLogIndex).join(':'),
-      value: unshield,
-    }));
-
-    // Write to DB
-    return this.db.batch(writeBatch, 'json');
-  }
-
-  /**
-   * Gets Commitment from tree
-   * @param tree - tree to get commitment from
-   * @param index - index of commitment
-   * @returns commitment
-   */
-  async getCommitment(tree: number, index: number): Promise<Commitment> {
+  async updateData(tree: number, index: number, data: T): Promise<void> {
     try {
-      const commitment = (await this.db.get(
-        this.getCommitmentDBPath(tree, index),
-        'json',
-      )) as Commitment;
-      return commitment;
+      this.lockUpdates = true;
+      const oldData = await this.getData(tree, index);
+      if (oldData.hash !== data.hash) {
+        throw new Error('Cannot update merkletree data with different hash.');
+      }
+      await this.db.put(this.getDataDBPath(tree, index), data, 'json');
+
+      this.lockUpdates = false;
+    } catch (err) {
+      if (!(err instanceof Error)) {
+        throw err;
+      }
+      this.lockUpdates = false;
+      throw new Error(err.message);
+    }
+  }
+
+  protected async getData(tree: number, index: number): Promise<T> {
+    try {
+      const data = (await this.db.get(this.getDataDBPath(tree, index), 'json')) as T;
+      return data;
     } catch (err) {
       if (!(err instanceof Error)) {
         throw err;
@@ -328,23 +251,9 @@ class MerkleTree {
     }
   }
 
-  /**
-   * Gets Unshield event
-   * @param txid - txid of commitment
-   * @returns commitment
-   */
-  async getUnshieldEvents(txid: string): Promise<UnshieldStoredEvent[]> {
-    const namespace = this.getUnshieldEventsDBPath(txid);
-    const keys: string[] = await this.db.getNamespaceKeys(namespace);
-    const keySplits = keys.map((key) => key.split(':')).filter((keySplit) => keySplit.length === 5);
-
-    return Promise.all(
-      keySplits.map(async (keySplit) => {
-        const unshieldEvent = (await this.db.get(keySplit, 'json')) as UnshieldStoredEvent;
-        unshieldEvent.timestamp = unshieldEvent.timestamp ?? undefined;
-        return unshieldEvent;
-      }),
-    );
+  // eslint-disable-next-line class-methods-use-this
+  sortMerkletreeDataByHash(array: T[]): T[] {
+    return array.sort((a, b) => (a.hash > b.hash ? 1 : -1));
   }
 
   /**
@@ -404,7 +313,7 @@ class MerkleTree {
   async getMerkletreesMetadata(): Promise<Optional<MerkletreesMetadata>> {
     try {
       const metadata = msgpack.decode(
-        arrayify((await this.db.get(this.getChainDBPrefix())) as BytesData),
+        arrayify((await this.db.get(this.getMerkletreeDBPrefix())) as BytesData),
       ) as MerkletreesMetadata;
       return metadata;
     } catch {
@@ -416,7 +325,7 @@ class MerkleTree {
    * Stores merkletrees metadata
    */
   async storeMerkletreesMetadata(metadata: MerkletreesMetadata): Promise<void> {
-    await this.db.put(this.getChainDBPrefix(), msgpack.encode(metadata));
+    await this.db.put(this.getMerkletreeDBPrefix(), msgpack.encode(metadata));
   }
 
   /**
@@ -456,6 +365,16 @@ class MerkleTree {
     await this.storeMerkletreesMetadata(merkletreesMetadata);
   }
 
+  async resetTreeLength(treeIndex: number): Promise<void> {
+    delete this.treeLengths[treeIndex];
+    const merkletreesMetadata = await this.getMerkletreesMetadata();
+    if (!merkletreesMetadata) {
+      return;
+    }
+    delete merkletreesMetadata.trees[treeIndex];
+    await this.storeMerkletreesMetadata(merkletreesMetadata);
+  }
+
   /**
    * WARNING: This operation takes a long time.
    */
@@ -466,8 +385,19 @@ class MerkleTree {
     ]);
   }
 
-  async clearLeavesFromDB(): Promise<void> {
-    await this.db.clearNamespace(this.getChainDBPrefix());
+  async getLatestIndexForTree(tree: number): Promise<number> {
+    const treeLength = await this.getTreeLength(tree);
+    return treeLength - 1;
+  }
+
+  async getLatestTreeAndIndex(): Promise<{ tree: number; index: number }> {
+    const latestTree = await this.latestTree();
+    const index = await this.getLatestIndexForTree(latestTree);
+    return { tree: latestTree, index };
+  }
+
+  async clearDataForMerkletree(): Promise<void> {
+    await this.db.clearNamespace(this.getMerkletreeDBPrefix());
     this.cachedNodeHashes = {};
     this.treeLengths = [];
   }
@@ -488,20 +418,13 @@ class MerkleTree {
   private async writeTreeToDB(
     treeIndex: number,
     hashWriteGroup: string[][],
-    commitmentWriteGroup: Commitment[],
+    dataWriteGroup: T[],
   ): Promise<void> {
-    // Build write batch operation
-    const nodeWriteBatch: PutBatch[] = [];
-    const commitmentWriteBatch: PutBatch[] = [];
-
-    // Get new leaves
     const newTreeLength = hashWriteGroup[0].length;
 
-    // Loop through each level
+    const nodeWriteBatch: PutBatch[] = [];
     hashWriteGroup.forEach((levelNodes, level) => {
-      // Loop through each index
       levelNodes.forEach((node, index) => {
-        // Push to node writeBatch array
         nodeWriteBatch.push({
           type: 'put',
           key: this.getNodeHashDBPath(treeIndex, level, index).join(':'),
@@ -511,18 +434,27 @@ class MerkleTree {
       });
     });
 
-    // Loop through each index
-    commitmentWriteGroup.forEach((commitment, index) => {
-      // Push to commitment writeBatch array
-      commitmentWriteBatch.push({
+    const dataWriteBatch: PutBatch[] = [];
+    const globalHashLookupBatch: PutBatch[] = [];
+    dataWriteGroup.forEach((data, index) => {
+      dataWriteBatch.push({
         type: 'put',
-        key: this.getCommitmentDBPath(treeIndex, index).join(':'),
-        value: commitment,
+        key: this.getDataDBPath(treeIndex, index).join(':'),
+        value: data,
       });
     });
 
-    // Batch write to DB
-    await Promise.all([this.db.batch(nodeWriteBatch), this.db.batch(commitmentWriteBatch, 'json')]);
+    await Promise.all([
+      this.db.batch(nodeWriteBatch),
+      this.db.batch(dataWriteBatch, 'json'),
+      this.db.batch(globalHashLookupBatch, 'utf8'),
+    ]);
+
+    // Call leaf/merkleroot storage (implemented in txid tree only)
+    const lastIndex = newTreeLength - 1;
+    const leaf = hashWriteGroup[0][lastIndex];
+    const merkleroot = hashWriteGroup[TREE_DEPTH][0];
+    await this.newLeafRootTrigger(treeIndex, lastIndex, leaf, merkleroot);
 
     // Update tree length
     this.treeLengths[treeIndex] = newTreeLength;
@@ -532,43 +464,121 @@ class MerkleTree {
   /**
    * Inserts array of leaves into tree
    * @param tree - Tree to insert leaves into
-   * @param leaves - Leaves to insert
    * @param startIndex - Starting index of leaves to insert
+   * @param leaves - Leaves to insert
    */
-  private async insertLeaves(
-    tree: number,
-    startIndex: number,
-    leaves: Commitment[],
-  ): Promise<void> {
+  private async insertLeaves(tree: number, startIndex: number, leaves: T[]): Promise<void> {
     // Start insertion at startIndex
     let index = startIndex;
 
     // Calculate ending index
-    let endIndex = startIndex + leaves.length;
+    const endIndex = startIndex + leaves.length;
 
-    // Start at level 0
-    let level = 0;
+    const firstLevelHashWriteGroup: string[][] = [];
+    const dataWriteGroup: T[] = [];
 
-    // Store next level index for when we begin updating the next level up
-    let nextLevelStartIndex = startIndex;
-
-    const hashWriteGroup: string[][] = [];
-    const commitmentWriteGroup: Commitment[] = [];
-
-    hashWriteGroup[level] = [];
+    firstLevelHashWriteGroup[0] = [];
 
     EngineDebug.log(`insertLeaves: startIndex ${startIndex}, group length ${leaves.length}`);
 
     // Push values to leaves of write index
     leaves.forEach((leaf) => {
       // Set writecache value
-      hashWriteGroup[level][index] = leaf.hash;
+      firstLevelHashWriteGroup[0][index] = leaf.hash;
 
-      commitmentWriteGroup[index] = leaf;
+      dataWriteGroup[index] = leaf;
 
       // Increment index
       index += 1;
     });
+
+    const hashWriteGroup: string[][] = await Merkletree.fillHashWriteGroup(
+      firstLevelHashWriteGroup,
+      tree,
+      startIndex,
+      endIndex,
+      (level, nodeIndex) => this.getNodeHash(tree, level, nodeIndex),
+    );
+
+    const leafIndex = leaves.length - 1;
+    const lastLeafIndex = startIndex + leafIndex;
+
+    const rootNode = hashWriteGroup[TREE_DEPTH][0];
+    const validRoot = await this.merklerootValidator(
+      this.txidVersion,
+      this.chain,
+      tree,
+      lastLeafIndex,
+      rootNode,
+    );
+
+    if (validRoot) {
+      await this.validRootCallback(tree, lastLeafIndex);
+    } else {
+      await this.invalidRootCallback(tree, lastLeafIndex, leaves[leafIndex]);
+      throw new Error(
+        `${INVALID_MERKLE_ROOT_ERROR_MESSAGE} [${this.merkletreeType}] Tree ${tree}, startIndex ${startIndex}, group length ${leaves.length}.`,
+      );
+    }
+
+    // If new root is valid, write to DB.
+    await this.writeTreeToDB(tree, hashWriteGroup, dataWriteGroup);
+  }
+
+  /**
+   * Rebuilds entire tree and writes to DB.
+   */
+  async rebuildAndWriteTree(tree: number): Promise<void> {
+    const firstLevelHashWriteGroup: string[][] = [];
+
+    firstLevelHashWriteGroup[0] = [];
+
+    // Cannot used cached treeLength value here because it is stale.
+    const treeLength = await this.getTreeLengthFromDBCount(tree);
+
+    const fetcher = new Array<Promise<Optional<T>>>(treeLength);
+
+    // Fetch each leaf we need to scan
+    for (let index = 0; index < treeLength; index += 1) {
+      fetcher[index] = this.getData(tree, index);
+    }
+    const leaves = await Promise.all(fetcher);
+
+    // Push values to leaves of write index
+    leaves.forEach((leaf, index) => {
+      firstLevelHashWriteGroup[0][index] = leaf?.hash ?? this.zeros[0];
+    });
+
+    const startIndex = 0;
+    const endIndex = treeLength - 1;
+
+    const hashWriteGroup: string[][] = await Merkletree.fillHashWriteGroup(
+      firstLevelHashWriteGroup,
+      tree,
+      startIndex,
+      endIndex,
+      async (level: number) => this.zeros[level],
+    );
+
+    const dataWriteGroup: T[] = [];
+
+    await this.writeTreeToDB(tree, hashWriteGroup, dataWriteGroup);
+  }
+
+  private static async fillHashWriteGroup(
+    firstLevelHashWriteGroup: string[][],
+    tree: number,
+    startIndex: number,
+    endIndex: number,
+    nodeHashLookup: (level: number, nodeIndex: number) => Promise<string>,
+  ): Promise<string[][]> {
+    const hashWriteGroup: string[][] = firstLevelHashWriteGroup;
+
+    let level = 0;
+
+    let index = startIndex;
+    let nextLevelStartIndex = startIndex;
+    let nextLevelEndIndex = endIndex;
 
     // Loop through each level and calculate values
     while (level < TREE_DEPTH) {
@@ -580,93 +590,50 @@ class MerkleTree {
       hashWriteGroup[level + 1] = hashWriteGroup[level + 1] ?? [];
 
       // Loop through every pair
-      for (index; index <= endIndex + 1; index += 2) {
+      for (index; index <= nextLevelEndIndex + 1; index += 2) {
         if (index % 2 === 0) {
           // Left
-          hashWriteGroup[level + 1][index >> 1] = MerkleTree.hashLeftRight(
-            hashWriteGroup[level][index] || (await this.getNodeHash(tree, level, index)),
-            hashWriteGroup[level][index + 1] || (await this.getNodeHash(tree, level, index + 1)),
+          hashWriteGroup[level + 1][index >> 1] = Merkletree.hashLeftRight(
+            hashWriteGroup[level][index] || (await nodeHashLookup(level, index)),
+            hashWriteGroup[level][index + 1] || (await nodeHashLookup(level, index + 1)),
           );
         } else {
           // Right
-          hashWriteGroup[level + 1][index >> 1] = MerkleTree.hashLeftRight(
-            hashWriteGroup[level][index - 1] || (await this.getNodeHash(tree, level, index - 1)),
-            hashWriteGroup[level][index] || (await this.getNodeHash(tree, level, index)),
+          hashWriteGroup[level + 1][index >> 1] = Merkletree.hashLeftRight(
+            hashWriteGroup[level][index - 1] || (await nodeHashLookup(level, index - 1)),
+            hashWriteGroup[level][index] || (await nodeHashLookup(level, index)),
           );
         }
       }
 
       // Calculate starting and ending index for the next level
       nextLevelStartIndex >>= 1;
-      endIndex >>= 1;
+      nextLevelEndIndex >>= 1;
 
       // Increment level
       level += 1;
     }
 
-    const rootNode = hashWriteGroup[TREE_DEPTH][0];
-    const validRoot = await this.rootValidator(tree, rootNode);
-
-    const leafIndex = leaves.length - 1;
-    const lastLeafIndex = startIndex + leafIndex;
-
-    if (validRoot) {
-      await this.removeInvalidMerklerootDetailsIfNecessary(tree, lastLeafIndex);
-    } else {
-      await this.updateInvalidMerklerootDetails(tree, lastLeafIndex, leaves[leafIndex].blockNumber);
-      throw new Error(
-        `${INVALID_MERKLE_ROOT_ERROR_MESSAGE} Tree ${tree}, startIndex ${startIndex}, group length ${leaves.length}.`,
-      );
-    }
-
-    // If new root is valid, write to DB.
-    await this.writeTreeToDB(tree, hashWriteGroup, commitmentWriteGroup);
+    return hashWriteGroup;
   }
 
-  async updateInvalidMerklerootDetails(
+  protected abstract newLeafRootTrigger(
+    tree: number,
+    index: number,
+    leaf: string,
+    merkleroot: string,
+  ): Promise<void>;
+
+  protected abstract validRootCallback(tree: number, lastValidLeafIndex: number): Promise<void>;
+
+  protected abstract invalidRootCallback(
     tree: number,
     lastKnownInvalidLeafIndex: number,
-    lastKnownInvalidLeafBlockNumber: number,
-  ) {
-    const invalidMerklerootDetails: Optional<InvalidMerklerootDetails> =
-      this.invalidMerklerootDetailsByTree[tree];
-    if (isDefined(invalidMerklerootDetails)) {
-      if (invalidMerklerootDetails.position < lastKnownInvalidLeafIndex) {
-        return;
-      }
-    }
-
-    // Update invalid merkleroot details
-    this.invalidMerklerootDetailsByTree[tree] = {
-      position: lastKnownInvalidLeafIndex,
-      blockNumber: lastKnownInvalidLeafBlockNumber,
-    };
-    await this.updateStoredMerkletreesMetadata(tree);
-  }
-
-  async removeInvalidMerklerootDetailsIfNecessary(tree: number, lastValidLeafIndex: number) {
-    const invalidMerklerootDetails: Optional<InvalidMerklerootDetails> =
-      this.invalidMerklerootDetailsByTree[tree];
-    if (!isDefined(invalidMerklerootDetails)) {
-      return;
-    }
-    if (invalidMerklerootDetails.position > lastValidLeafIndex) {
-      return;
-    }
-    delete this.invalidMerklerootDetailsByTree[tree];
-    await this.updateStoredMerkletreesMetadata(tree);
-  }
-
-  getFirstInvalidMerklerootTree(): Optional<number> {
-    const invalidTrees = Object.keys(this.invalidMerklerootDetailsByTree);
-    if (!invalidTrees.length) {
-      return undefined;
-    }
-    return Number(invalidTrees.sort()[0]);
-  }
+    lastKnownInvalidLeaf: T,
+  ): Promise<void>;
 
   private async processWriteQueueForTree(treeIndex: number): Promise<void> {
-    let processingGroupSize = CommitmentProcessingGroupSize.XXXLarge;
+    let processingGroupSize = this.defaultCommitmentProcessingSize;
 
     let currentTreeLength = await this.getTreeLength(treeIndex);
     const treeWriteQueue = this.writeQueue[treeIndex];
@@ -687,7 +654,7 @@ class MerkleTree {
     while (isDefined(this.writeQueue[treeIndex])) {
       // Process leaves as a group until we hit an invalid merkleroot.
       // Then, process each single item.
-      // This optimizes for fewer `rootValidator` calls, while still protecting
+      // This optimizes for fewer `merklerootValidator` calls, while still protecting
       // users against invalid roots and broken trees.
 
       this.processingWriteQueueTrees[treeIndex] = true;
@@ -714,7 +681,7 @@ class MerkleTree {
         const ignoreInTests = true;
         EngineDebug.error(err, ignoreInTests);
         if (err.message.startsWith(INVALID_MERKLE_ROOT_ERROR_MESSAGE)) {
-          const nextProcessingGroupSize = MerkleTree.nextProcessingGroupSize(processingGroupSize);
+          const nextProcessingGroupSize = Merkletree.nextProcessingGroupSize(processingGroupSize);
           if (nextProcessingGroupSize) {
             EngineDebug.log(
               `${processWriteQueuePrefix} Invalid merkleroot found. Processing with group size ${nextProcessingGroupSize}.`,
@@ -789,18 +756,18 @@ class MerkleTree {
     const commitmentGroupIndices = [currentTreeLength];
     let nextIndex = currentTreeLength + nextCommitmentGroup.length;
 
-    const commitmentGroups: Commitment[][] = [nextCommitmentGroup];
+    const dataWriteGroups: T[][] = [nextCommitmentGroup];
     while (
-      maxCommitmentGroupsToProcess > commitmentGroups.length &&
+      maxCommitmentGroupsToProcess > dataWriteGroups.length &&
       isDefined(this.writeQueue[treeIndex][nextIndex])
     ) {
       commitmentGroupIndices.push(nextIndex);
       const next = this.writeQueue[treeIndex][nextIndex];
-      commitmentGroups.push(next);
+      dataWriteGroups.push(next);
       nextIndex += next.length;
     }
 
-    await this.insertLeaves(treeIndex, currentTreeLength, commitmentGroups.flat());
+    await this.insertLeaves(treeIndex, currentTreeLength, dataWriteGroups.flat());
 
     // Delete the batch after processing it.
     // Ensures bad batches are deleted, therefore halting update loop if one is found.
@@ -811,13 +778,17 @@ class MerkleTree {
     return true;
   }
 
+  static numNodesPerLevel(level: number): number {
+    return TREE_MAX_ITEMS >> level;
+  }
+
   private treeIndicesFromWriteQueue(): number[] {
     return this.writeQueue
       .map((_tree, treeIndex) => treeIndex)
       .filter((index) => !Number.isNaN(index));
   }
 
-  async updateTrees(): Promise<void> {
+  async updateTreesFromWriteQueue(): Promise<void> {
     const treeIndices: number[] = this.treeIndicesFromWriteQueue();
     await Promise.all(treeIndices.map((treeIndex) => this.processWriteQueueForTree(treeIndex)));
   }
@@ -828,7 +799,11 @@ class MerkleTree {
    * @param leaves - leaves to add
    * @param startingIndex - index of first leaf
    */
-  async queueLeaves(tree: number, startingIndex: number, leaves: Commitment[]): Promise<void> {
+  async queueLeaves(tree: number, startingIndex: number, leaves: T[]): Promise<void> {
+    if (this.lockUpdates) {
+      return;
+    }
+
     // Get tree length
     const treeLength = await this.getTreeLength(tree);
 
@@ -842,7 +817,7 @@ class MerkleTree {
       this.writeQueue[tree][startingIndex] = leaves;
 
       EngineDebug.log(
-        `[queueLeaves: ${this.chain.type}:${this.chain.id}] treeLength ${treeLength}, startingIndex ${startingIndex}`,
+        `[${this.merkletreeType} queueLeaves: ${this.chain.type}:${this.chain.id}] treeLength ${treeLength}, startingIndex ${startingIndex}`,
       );
     }
   }
@@ -856,29 +831,4 @@ class MerkleTree {
     while ((await this.getTreeLength(latestTree)) > 0) latestTree += 1;
     return Math.max(0, latestTree - 1);
   }
-
-  /**
-   * Verifies a merkle proof
-   * @param proof - proof to verify
-   * @returns is valid
-   */
-  static verifyProof(proof: MerkleProof): boolean {
-    // Get indicies as BN form
-    const indices = numberify(proof.indices);
-
-    // Calculate proof root and return if it matches the proof in the MerkleProof
-    // Loop through each element and hash till we've reduced to 1 element
-    const calculatedRoot = proof.elements.reduce((current, element, index) => {
-      // If index is right
-      if (indices.testn(index)) {
-        return MerkleTree.hashLeftRight(element, current);
-      }
-
-      // If index is left
-      return MerkleTree.hashLeftRight(current, element);
-    }, proof.leaf);
-    return hexlify(proof.root) === hexlify(calculatedRoot);
-  }
 }
-
-export { MerkleTree };

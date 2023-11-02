@@ -8,8 +8,12 @@ import { Database } from '../database/database';
 import EngineDebug from '../debugger/debugger';
 import { encodeAddress } from '../key-derivation/bech32';
 import { SpendingPublicKey, ViewingKeyPair, WalletNode } from '../key-derivation/wallet-node';
-import { MerkleTree } from '../merkletree/merkletree';
-import { EngineEvent, UnshieldStoredEvent, WalletScannedEventData } from '../models/event-types';
+import {
+  EngineEvent,
+  POICurrentProofEventData,
+  UnshieldStoredEvent,
+  WalletScannedEventData,
+} from '../models/event-types';
 import {
   BytesData,
   Ciphertext,
@@ -18,15 +22,22 @@ import {
   LegacyEncryptedCommitment,
   LegacyGeneratedCommitment,
   LegacyNoteSerialized,
+  MerkleProof,
   NoteAnnotationData,
   NoteSerialized,
   OutputType,
   ShieldCommitment,
   StoredReceiveCommitment,
   StoredSendCommitment,
+  TXIDMerkletreeData,
   TransactCommitment,
 } from '../models/formatted-types';
-import { SentCommitment, TXO } from '../models/txo-types';
+import {
+  SentCommitment,
+  TXO,
+  TXOsReceivedPOIStatusInfo,
+  TXOsSpentPOIStatusInfo,
+} from '../models/txo-types';
 import { Memo, LEGACY_MEMO_METADATA_BYTE_CHUNKS } from '../note/memo';
 import {
   arrayify,
@@ -44,9 +55,10 @@ import {
 import { getSharedSymmetricKey, signED25519 } from '../utils/keys-utils';
 import {
   AddressKeys,
-  Balances,
-  BalancesByTree,
+  AllBalances,
+  TotalBalancesByTreeNumber,
   ShareableViewingKeyData,
+  TokenBalances,
   TransactionHistoryEntry,
   TransactionHistoryEntryPreprocessSpent,
   TransactionHistoryEntryReceived,
@@ -67,10 +79,33 @@ import { TransactNote } from '../note/transact-note';
 import { binarySearchForUpperBoundIndex } from '../utils/search';
 import { getSharedSymmetricKeyLegacy } from '../utils/keys-utils-legacy';
 import { ShieldNote } from '../note';
-import { getTokenDataHash, serializeTokenData } from '../note/note-util';
+import { getTokenDataERC20, getTokenDataHash, serializeTokenData } from '../note/note-util';
 import { TokenDataGetter } from '../token/token-data-getter';
-import { isDefined } from '../utils/is-defined';
-import { PublicInputs } from '../models/prover-types';
+import { isDefined, removeDuplicates, removeUndefineds } from '../utils/is-defined';
+import { PublicInputsRailgun } from '../models/prover-types';
+import { UTXOMerkletree } from '../merkletree/utxo-merkletree';
+import { isSentCommitment, isSentCommitmentType } from '../utils/commitment';
+import { POI } from '../poi/poi';
+import {
+  getBlindedCommitmentForShieldOrTransact,
+  getBlindedCommitmentForUnshield,
+} from '../poi/blinded-commitment';
+import { TXIDMerkletree } from '../merkletree/txid-merkletree';
+import {
+  ACTIVE_TXID_VERSIONS,
+  BlindedCommitmentData,
+  BlindedCommitmentType,
+  POIEngineProofInputs,
+  POIsPerList,
+  TXIDVersion,
+} from '../models/poi-types';
+import { getGlobalTreePosition } from '../poi/global-tree-position';
+import { createDummyMerkleProof } from '../merkletree/merkle-proof';
+import { Prover } from '../prover/prover';
+import {
+  formatTXOsReceivedPOIStatusInfo,
+  formatTXOsSpentPOIStatusInfo,
+} from '../poi/poi-status-formatter';
 
 type ScannedDBCommitment = PutBatch<string, Buffer>;
 
@@ -86,6 +121,16 @@ type CachedStoredSendCommitment = {
   storedSendCommitment: StoredSendCommitment;
 };
 
+type GeneratePOIsData = {
+  railgunTxid: string;
+  listKey: string;
+  isLegacyPOIProof: boolean;
+  spentTXOs: TXO[];
+  txidMerkletreeData: TXIDMerkletreeData;
+  sentCommitments: SentCommitment[];
+  unshieldEvents: UnshieldStoredEvent[];
+};
+
 abstract class AbstractWallet extends EventEmitter {
   protected readonly db: Database;
 
@@ -99,7 +144,13 @@ abstract class AbstractWallet extends EventEmitter {
 
   readonly nullifyingKey: bigint;
 
-  readonly merkletrees: MerkleTree[][] = [];
+  private readonly utxoMerkletrees: { [txidVersion: string]: UTXOMerkletree[][] } = {};
+
+  private readonly txidMerkletrees: { [txidVersion: string]: TXIDMerkletree[][] } = {};
+
+  readonly isRefreshingPOIs: boolean[][] = [];
+
+  private readonly prover: Prover;
 
   private creationBlockNumbers: Optional<number[][]>;
 
@@ -108,6 +159,8 @@ abstract class AbstractWallet extends EventEmitter {
 
   // [type: [id: CachedStoredSendCommitment[]]]
   private cachedSendCommitments: CachedStoredSendCommitment[][][] = [];
+
+  private generatingPOIsForChain: boolean[][] = [];
 
   /**
    * Create Wallet controller
@@ -120,6 +173,7 @@ abstract class AbstractWallet extends EventEmitter {
     viewingKeyPair: ViewingKeyPair,
     spendingPublicKey: SpendingPublicKey,
     creationBlockNumbers: Optional<number[][]>,
+    prover: Prover,
   ) {
     super();
 
@@ -130,27 +184,68 @@ abstract class AbstractWallet extends EventEmitter {
     this.nullifyingKey = poseidon([BigInt(hexlify(this.viewingKeyPair.privateKey, true))]);
     this.masterPublicKey = WalletNode.getMasterPublicKey(spendingPublicKey, this.nullifyingKey);
     this.creationBlockNumbers = creationBlockNumbers;
+    this.prover = prover;
   }
 
   /**
-   * Loads merkle tree into wallet
-   * @param merkletree - merkletree to load
+   * Loads utxo merkle tree into wallet
    */
-  loadMerkletree(merkletree: MerkleTree) {
-    this.merkletrees[merkletree.chain.type] ??= [];
-    this.merkletrees[merkletree.chain.type][merkletree.chain.id] = merkletree;
+  loadUTXOMerkletree(txidVersion: TXIDVersion, utxoMerkletree: UTXOMerkletree) {
+    this.utxoMerkletrees[txidVersion] ??= [];
+    this.utxoMerkletrees[txidVersion][utxoMerkletree.chain.type] ??= [];
+    this.utxoMerkletrees[txidVersion][utxoMerkletree.chain.type][utxoMerkletree.chain.id] =
+      utxoMerkletree;
   }
 
   /**
-   * Unload merkle tree by chain
-   * @param chain - chain type/id of tree to unload
+   * Loads txid merkle tree into wallet
    */
-  unloadMerkletree(chain: Chain) {
-    delete this.merkletrees[chain.type]?.[chain.id];
+  loadRailgunTXIDMerkletree(txidVersion: TXIDVersion, txidMerkletree: TXIDMerkletree) {
+    this.txidMerkletrees[txidVersion] ??= [];
+    this.txidMerkletrees[txidVersion][txidMerkletree.chain.type] ??= [];
+    this.txidMerkletrees[txidVersion][txidMerkletree.chain.type][txidMerkletree.chain.id] =
+      txidMerkletree;
+  }
+
+  /**
+   * Unload utxo merkle tree by chain
+   */
+  unloadUTXOMerkletree(txidVersion: TXIDVersion, chain: Chain) {
+    delete this.utxoMerkletrees[txidVersion]?.[chain.type]?.[chain.id];
+  }
+
+  /**
+   * Unload txid merkle tree by chain
+   */
+  unloadRailgunTXIDMerkletree(txidVersion: TXIDVersion, chain: Chain) {
+    delete this.txidMerkletrees[txidVersion]?.[chain.type]?.[chain.id];
   }
 
   private createTokenDataGetter(chain: Chain): TokenDataGetter {
     return new TokenDataGetter(this.db, chain);
+  }
+
+  private emitPOIProofUpdateEvent(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    progress: number,
+    listKey: string,
+    txid: string,
+    railgunTxid: string,
+    index: number,
+    totalCount: number,
+  ) {
+    const updateData: POICurrentProofEventData = {
+      txidVersion,
+      chain,
+      progress,
+      listKey,
+      txid,
+      railgunTxid,
+      index,
+      totalCount,
+    };
+    this.emit(EngineEvent.POIProofUpdate, updateData);
   }
 
   /**
@@ -274,7 +369,11 @@ abstract class AbstractWallet extends EventEmitter {
    * @param chain - chain type/id
    * @returns walletDetails - including treeScannedHeight
    */
-  async getWalletDetails(chain: Chain): Promise<WalletDetails> {
+  async getWalletDetails(txidVersion: TXIDVersion, chain: Chain): Promise<WalletDetails> {
+    if (txidVersion !== TXIDVersion.V2_PoseidonMerkle) {
+      throw new Error('Wallet details will be incorrect for this TXID version - needs migration');
+    }
+
     let walletDetails: WalletDetails;
 
     try {
@@ -345,6 +444,7 @@ abstract class AbstractWallet extends EventEmitter {
   }
 
   private async createScannedDBCommitments(
+    txidVersion: TXIDVersion,
     leaf: Commitment,
     viewingPrivateKey: Uint8Array,
     tree: number,
@@ -544,6 +644,9 @@ abstract class AbstractWallet extends EventEmitter {
         senderAddress: noteReceive.senderAddressData
           ? encodeAddress(noteReceive.senderAddressData)
           : undefined,
+        commitmentType: leaf.commitmentType,
+        poisPerList: undefined,
+        blindedCommitment: undefined,
       };
       EngineDebug.log(`Adding RECEIVE commitment at ${position} (Wallet ${this.id}).`);
       scannedCommitments.push({
@@ -551,11 +654,11 @@ abstract class AbstractWallet extends EventEmitter {
         key: this.getWalletReceiveCommitmentDBPrefix(chain, tree, position).join(':'),
         value: msgpack.encode(storedReceiveCommitment),
       });
-      AbstractWallet.addCachedStoredCommitment(chain, this.cachedReceiveCommitments, {
-        storedReceiveCommitment,
-        tree,
-        position,
-      });
+      // AbstractWallet.addCachedStoredCommitment(chain, this.cachedReceiveCommitments, {
+      //   storedReceiveCommitment,
+      //   tree,
+      //   position,
+      // });
     }
 
     if (noteSend && serializedNoteSend) {
@@ -563,8 +666,12 @@ abstract class AbstractWallet extends EventEmitter {
         txid: leaf.txid,
         timestamp: leaf.timestamp,
         decrypted: serializedNoteSend,
+        commitmentType: leaf.commitmentType,
         noteExtraData: Memo.decryptNoteAnnotationData(noteSend.annotationData, viewingPrivateKey),
         recipientAddress: encodeAddress(noteSend.receiverAddressData),
+        railgunTxid: undefined,
+        poisPerList: undefined,
+        blindedCommitment: undefined,
       };
       EngineDebug.log(`Adding SPEND commitment at ${position} (Wallet ${this.id}).`);
       scannedCommitments.push({
@@ -572,11 +679,11 @@ abstract class AbstractWallet extends EventEmitter {
         key: this.getWalletSentCommitmentDBPrefix(chain, tree, position).join(':'),
         value: msgpack.encode(storedSendCommitment),
       });
-      AbstractWallet.addCachedStoredCommitment(chain, this.cachedSendCommitments, {
-        storedSendCommitment,
-        tree,
-        position,
-      });
+      // AbstractWallet.addCachedStoredCommitment(chain, this.cachedSendCommitments, {
+      //   storedSendCommitment,
+      //   tree,
+      //   position,
+      // });
     }
 
     return scannedCommitments;
@@ -591,6 +698,7 @@ abstract class AbstractWallet extends EventEmitter {
    * @param {number} startScanHeight - starting position
    */
   async scanLeaves(
+    txidVersion: TXIDVersion,
     leaves: Optional<Commitment>[],
     tree: number,
     chain: Chain,
@@ -613,6 +721,7 @@ abstract class AbstractWallet extends EventEmitter {
       }
       const scanPromiseWithTicker = async () => {
         const scanned = await this.createScannedDBCommitments(
+          txidVersion,
           leaf,
           vpk,
           tree,
@@ -643,13 +752,6 @@ abstract class AbstractWallet extends EventEmitter {
   private async queryAllStoredReceiveCommitments(
     chain: Chain,
   ): Promise<CachedStoredReceiveCommitment[]> {
-    if (
-      isDefined(this.cachedReceiveCommitments[chain.type]) &&
-      isDefined(this.cachedReceiveCommitments[chain.type][chain.id])
-    ) {
-      return this.cachedReceiveCommitments[chain.type][chain.id];
-    }
-
     const namespace = this.getWalletDBPrefix(chain);
     const keySplits = await this.keySplits(namespace, 5);
 
@@ -664,21 +766,16 @@ abstract class AbstractWallet extends EventEmitter {
         return { storedReceiveCommitment, tree, position };
       }),
     );
-
-    if (!isDefined(this.cachedReceiveCommitments[chain.type])) {
-      this.cachedReceiveCommitments[chain.type] = [];
-    }
-    this.cachedReceiveCommitments[chain.type][chain.id] = dbStoredReceiveCommitments;
     return dbStoredReceiveCommitments;
   }
 
   private async queryAllStoredSendCommitments(chain: Chain): Promise<CachedStoredSendCommitment[]> {
-    if (
-      isDefined(this.cachedSendCommitments[chain.type]) &&
-      isDefined(this.cachedSendCommitments[chain.type][chain.id])
-    ) {
-      return this.cachedSendCommitments[chain.type][chain.id];
-    }
+    // if (
+    //   isDefined(this.cachedSendCommitments[chain.type]) &&
+    //   isDefined(this.cachedSendCommitments[chain.type][chain.id])
+    // ) {
+    //   return this.cachedSendCommitments[chain.type][chain.id];
+    // }
 
     const namespace = this.getWalletSentCommitmentDBPrefix(chain);
     const keySplits = await this.keySplits(namespace, 5);
@@ -695,81 +792,92 @@ abstract class AbstractWallet extends EventEmitter {
       }),
     );
 
-    if (!isDefined(this.cachedSendCommitments[chain.type])) {
-      this.cachedSendCommitments[chain.type] = [];
-    }
-    this.cachedSendCommitments[chain.type][chain.id] = dbStoredSendCommitments;
+    // this.cachedSendCommitments[chain.type] ??= [];
+    // this.cachedSendCommitments[chain.type][chain.id] = dbStoredSendCommitments;
     return dbStoredSendCommitments;
   }
 
-  private static addCachedStoredCommitment<Cache extends { tree: number; position: number }[][][]>(
-    chain: Chain,
-    commitmentCache: Cache,
-    cachedCommitment: CachedStoredReceiveCommitment | CachedStoredSendCommitment,
-  ) {
-    if (
-      !isDefined(commitmentCache[chain.type]) ||
-      !isDefined(commitmentCache[chain.type][chain.id])
-    ) {
-      return;
-    }
-    const cacheForChain = commitmentCache[chain.type][chain.id];
-    const found = cacheForChain.find((stored) => {
-      return stored.tree === cachedCommitment.tree && stored.position === cachedCommitment.position;
-    });
-    if (found) {
-      return;
-    }
-    cacheForChain.push(cachedCommitment);
-  }
+  // private static addCachedStoredCommitment<Cache extends { tree: number; position: number }[][][]>(
+  //   chain: Chain,
+  //   commitmentCache: Cache,
+  //   cachedCommitment: CachedStoredReceiveCommitment | CachedStoredSendCommitment,
+  // ) {
+  //   if (
+  //     !isDefined(commitmentCache[chain.type]) ||
+  //     !isDefined(commitmentCache[chain.type][chain.id])
+  //   ) {
+  //     return;
+  //   }
+  //   const cacheForChain = commitmentCache[chain.type][chain.id];
+  //   const found = cacheForChain.find((stored) => {
+  //     return stored.tree === cachedCommitment.tree && stored.position === cachedCommitment.position;
+  //   });
+  //   if (found) {
+  //     return;
+  //   }
+  //   cacheForChain.push(cachedCommitment);
+  // }
 
   /**
    * Get TXOs list of a chain
    * @param chain - chain type/id to get UTXOs for
    * @returns UTXOs list
    */
-  async TXOs(chain: Chain): Promise<TXO[]> {
+  async TXOs(txidVersion: TXIDVersion, chain: Chain): Promise<TXO[]> {
     const recipientAddress = encodeAddress(this.addressKeys);
     const vpk = this.getViewingKeyPair().privateKey;
-    const merkletree = this.getMerkletreeForChain(chain);
+    const merkletree = this.getUTXOMerkletree(txidVersion, chain);
     const tokenDataGetter = this.createTokenDataGetter(chain);
 
     const storedReceiveCommitments = await this.queryAllStoredReceiveCommitments(chain);
 
     return Promise.all(
       storedReceiveCommitments.map(async ({ storedReceiveCommitment, tree, position }) => {
-        const txo = storedReceiveCommitment;
-
-        // Check if TXO has been spent.
-        if (txo.spendtxid === false) {
-          const storedNullifier = await merkletree.getStoredNullifierTxid(txo.nullifier);
-          if (isDefined(storedNullifier)) {
-            txo.spendtxid = storedNullifier;
-            // Write nullifier spend txid to db.
-            await this.db.put(
-              this.getWalletReceiveCommitmentDBPrefix(chain, tree, position),
-              msgpack.encode(txo),
-            );
-          }
-        }
+        const receiveCommitment = storedReceiveCommitment;
 
         const note = await TransactNote.deserialize(
           {
-            ...txo.decrypted,
+            ...receiveCommitment.decrypted,
             recipientAddress,
           },
           vpk,
           tokenDataGetter,
         );
 
-        return {
+        // Check if TXO has been spent.
+        if (receiveCommitment.spendtxid === false) {
+          const nullifierTxid = await merkletree.getNullifierTxid(receiveCommitment.nullifier);
+          if (isDefined(nullifierTxid)) {
+            receiveCommitment.spendtxid = nullifierTxid;
+            await this.updateReceiveCommitmentInDB(chain, tree, position, receiveCommitment);
+          }
+        }
+
+        // Look up blinded commitment.
+        if (!isDefined(receiveCommitment.blindedCommitment)) {
+          const globalTreePosition = getGlobalTreePosition(tree, position);
+          const commitment = await merkletree.getCommitment(tree, position);
+          receiveCommitment.blindedCommitment = getBlindedCommitmentForShieldOrTransact(
+            commitment.hash,
+            note.notePublicKey,
+            globalTreePosition,
+          );
+          await this.updateReceiveCommitmentInDB(chain, tree, position, receiveCommitment);
+        }
+
+        const txo: TXO = {
           tree,
           position,
-          txid: txo.txid,
-          timestamp: txo.timestamp,
-          spendtxid: txo.spendtxid,
+          txid: receiveCommitment.txid,
+          timestamp: receiveCommitment.timestamp,
+          spendtxid: receiveCommitment.spendtxid,
+          nullifier: receiveCommitment.nullifier,
           note,
+          poisPerList: receiveCommitment.poisPerList,
+          blindedCommitment: receiveCommitment.blindedCommitment,
+          commitmentType: receiveCommitment.commitmentType,
         };
+        return txo;
       }),
     );
   }
@@ -779,7 +887,8 @@ abstract class AbstractWallet extends EventEmitter {
    * @param chain - chain type/id to get spent commitments for
    * @returns SentCommitment list
    */
-  async getSentCommitments(
+  private async getSentCommitments(
+    txidVersion: TXIDVersion,
     chain: Chain,
     startingBlock: Optional<number>,
   ): Promise<SentCommitment[]> {
@@ -804,6 +913,25 @@ abstract class AbstractWallet extends EventEmitter {
           return;
         }
 
+        // Look up railgunTxid.
+        if (
+          !isDefined(sentCommitment.railgunTxid) ||
+          !isDefined(sentCommitment.blindedCommitment)
+        ) {
+          const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
+          const commitment = await utxoMerkletree.getCommitment(tree, position);
+
+          if (isSentCommitment(commitment) && isDefined(commitment.railgunTxid)) {
+            sentCommitment.blindedCommitment = getBlindedCommitmentForShieldOrTransact(
+              commitment.hash,
+              note.notePublicKey,
+              getGlobalTreePosition(commitment.utxoTree, commitment.utxoIndex),
+            );
+            sentCommitment.railgunTxid = commitment.railgunTxid;
+          }
+          await this.updateSentCommitmentInDB(chain, tree, position, sentCommitment);
+        }
+
         sentCommitments.push({
           tree,
           position,
@@ -812,11 +940,546 @@ abstract class AbstractWallet extends EventEmitter {
           note,
           noteAnnotationData: sentCommitment.noteExtraData,
           isLegacyTransactNote: TransactNote.isLegacyTransactNote(sentCommitment.decrypted),
+          railgunTxid: sentCommitment.railgunTxid,
+          poisPerList: sentCommitment.poisPerList,
+          blindedCommitment: sentCommitment.blindedCommitment,
+          commitmentType: sentCommitment.commitmentType,
         });
       }),
     );
 
     return sentCommitments;
+  }
+
+  private async updateReceiveCommitmentInDB(
+    chain: Chain,
+    tree: number,
+    position: number,
+    receiveCommitment: StoredReceiveCommitment,
+  ): Promise<void> {
+    await this.db.put(
+      this.getWalletReceiveCommitmentDBPrefix(chain, tree, position),
+      msgpack.encode(receiveCommitment),
+    );
+    // Update cache
+    // this.cachedReceiveCommitments?.[chain.type]?.[chain.id].forEach((cachedCommitment) => {
+    //   if (cachedCommitment.tree === tree && cachedCommitment.position === position) {
+    //     // eslint-disable-next-line no-param-reassign
+    //     cachedCommitment.storedReceiveCommitment = receiveCommitment;
+    //   }
+    // });
+  }
+
+  private async updateSentCommitmentInDB(
+    chain: Chain,
+    tree: number,
+    position: number,
+    sentCommitment: StoredSendCommitment,
+  ): Promise<void> {
+    await this.db.put(
+      this.getWalletSentCommitmentDBPrefix(chain, tree, position),
+      msgpack.encode(sentCommitment),
+    );
+    // Update cache
+    // this.cachedSendCommitments?.[chain.type]?.[chain.id].forEach((cachedCommitment) => {
+    //   if (cachedCommitment.tree === tree && cachedCommitment.position === position) {
+    //     // eslint-disable-next-line no-param-reassign
+    //     cachedCommitment.storedSendCommitment = sentCommitment;
+    //   }
+    // });
+  }
+
+  async getTXOsReceivedPOIStatusInfo(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<TXOsReceivedPOIStatusInfo[]> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    return formatTXOsReceivedPOIStatusInfo(TXOs);
+  }
+
+  async getTXOsSpentPOIStatusInfo(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<TXOsSpentPOIStatusInfo[]> {
+    const [sentCommitments, TXOs] = await Promise.all([
+      this.getSentCommitments(txidVersion, chain, undefined),
+      this.TXOs(txidVersion, chain),
+    ]);
+    const unshieldEvents = await this.getUnshieldEventsFromSpentNullifiers(
+      txidVersion,
+      chain,
+      TXOs,
+    );
+    const txidMerkletree = this.getRailgunTXIDMerkletreeForChain(txidVersion, chain);
+    return formatTXOsSpentPOIStatusInfo(txidMerkletree, sentCommitments, TXOs, unshieldEvents);
+  }
+
+  async getNumSpendPOIProofsPossible(txidVersion: TXIDVersion, chain: Chain): Promise<number> {
+    const spendProofStatusInfo = await this.getTXOsSpentPOIStatusInfo(txidVersion, chain);
+    const totalListKeysCanGenerateSpentPOIs = spendProofStatusInfo.reduce(
+      (acc, curr) => acc + curr.strings.listKeysCanGenerateSpentPOIs.length,
+      0,
+    );
+    return totalListKeysCanGenerateSpentPOIs;
+  }
+
+  async refreshReceivePOIsAllTXOs(txidVersion: TXIDVersion, chain: Chain): Promise<void> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    const txosNeedCreationPOIs = TXOs.filter((txo) => POI.shouldRetrieveCreationPOIs(txo)).sort(
+      (a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b),
+    );
+    if (txosNeedCreationPOIs.length === 0) {
+      return;
+    }
+
+    const blindedCommitmentDatas: BlindedCommitmentData[] = txosNeedCreationPOIs.map((txo) => ({
+      type: isSentCommitmentType(txo.commitmentType)
+        ? BlindedCommitmentType.Transact
+        : BlindedCommitmentType.Shield,
+      blindedCommitment: txo.blindedCommitment as string,
+    }));
+    const blindedCommitmentToPOIList = await POI.retrievePOIsForBlindedCommitments(
+      txidVersion,
+      chain,
+      blindedCommitmentDatas,
+    );
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const txo of txosNeedCreationPOIs) {
+      if (!isDefined(txo.blindedCommitment)) {
+        continue;
+      }
+      const poisPerList = blindedCommitmentToPOIList[txo.blindedCommitment];
+      if (!isDefined(poisPerList)) {
+        continue;
+      }
+      txo.poisPerList = poisPerList;
+      await this.updateReceiveCommitmentCreatedPOIs(chain, txo.tree, txo.position, txo.poisPerList);
+    }
+  }
+
+  private static sortPOIsPerListUndefinedFirst(
+    a: { poisPerList: Optional<POIsPerList> },
+    b: { poisPerList: Optional<POIsPerList> },
+  ) {
+    return isDefined(a.poisPerList) && !isDefined(b.poisPerList) ? -1 : 1;
+  }
+
+  private static filterByRailgunTxid(
+    item: { railgunTxid: Optional<string> },
+    railgunTxid: Optional<string>,
+  ) {
+    return isDefined(railgunTxid) ? item.railgunTxid === railgunTxid : true;
+  }
+
+  async getSentCommitmentsAndUnshieldEventsNeedPOIs(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    filterRailgunTxid?: string,
+  ) {
+    const [sentCommitments, TXOs] = await Promise.all([
+      this.getSentCommitments(txidVersion, chain, undefined),
+      this.TXOs(txidVersion, chain),
+    ]);
+    const sentCommitmentsNeedPOIs = sentCommitments
+      .filter((sendCommitment) => POI.shouldRetrieveSpentPOIs(sendCommitment))
+      .filter((sentCommitment) =>
+        AbstractWallet.filterByRailgunTxid(sentCommitment, filterRailgunTxid),
+      )
+      .sort((a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b));
+
+    const unshieldEvents = await this.getUnshieldEventsFromSpentNullifiers(
+      txidVersion,
+      chain,
+      TXOs,
+    );
+    const unshieldEventsNeedPOIs = unshieldEvents
+      .filter((unshieldEvent) => POI.shouldGenerateSpentPOIsUnshieldEvent(unshieldEvent))
+      .filter((unshieldEvent) =>
+        AbstractWallet.filterByRailgunTxid(unshieldEvent, filterRailgunTxid),
+      )
+      .sort((a, b) => AbstractWallet.sortPOIsPerListUndefinedFirst(a, b));
+
+    return { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs, TXOs };
+  }
+
+  async refreshSpentPOIsAllSentCommitmentsAndUnshieldEvents(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    filterRailgunTxid?: string,
+  ): Promise<void> {
+    const { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs } =
+      await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(txidVersion, chain, filterRailgunTxid);
+    if (!sentCommitmentsNeedPOIs.length && !unshieldEventsNeedPOIs.length) {
+      return;
+    }
+
+    const blindedCommitmentDatas: BlindedCommitmentData[] = [
+      ...sentCommitmentsNeedPOIs.map((sentCommitment) => ({
+        type: isSentCommitmentType(sentCommitment.commitmentType)
+          ? BlindedCommitmentType.Transact
+          : BlindedCommitmentType.Shield,
+        blindedCommitment: sentCommitment.blindedCommitment as string,
+      })),
+      ...unshieldEventsNeedPOIs.map((unshieldEvent) => ({
+        type: BlindedCommitmentType.Transact,
+        blindedCommitment: getBlindedCommitmentForUnshield(unshieldEvent.railgunTxid as string),
+      })),
+    ];
+    const blindedCommitmentToPOIList = await POI.retrievePOIsForBlindedCommitments(
+      txidVersion,
+      chain,
+      blindedCommitmentDatas,
+    );
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const sentCommitment of sentCommitmentsNeedPOIs) {
+      if (!isDefined(sentCommitment.blindedCommitment)) {
+        continue;
+      }
+      const poisPerList = blindedCommitmentToPOIList[sentCommitment.blindedCommitment];
+      if (!isDefined(poisPerList)) {
+        continue;
+      }
+      sentCommitment.poisPerList = poisPerList;
+      await this.updateSentCommitmentSpentPOIs(
+        chain,
+        sentCommitment.tree,
+        sentCommitment.position,
+        sentCommitment.poisPerList,
+      );
+    }
+
+    const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const unshieldEvent of unshieldEventsNeedPOIs) {
+      if (!isDefined(unshieldEvent.railgunTxid)) {
+        continue;
+      }
+      const blindedCommitment = getBlindedCommitmentForUnshield(unshieldEvent.railgunTxid);
+      const poisPerList = blindedCommitmentToPOIList[blindedCommitment];
+      if (!isDefined(poisPerList)) {
+        continue;
+      }
+      unshieldEvent.poisPerList = poisPerList;
+      await utxoMerkletree.updateUnshieldEvent(unshieldEvent);
+    }
+  }
+
+  async generatePOIsAllSentCommitmentsAndUnshieldEvents(
+    chain: Chain,
+    txidVersion: TXIDVersion,
+    railgunTxidFilter?: string,
+  ): Promise<void> {
+    if (this.generatingPOIsForChain[chain.type]?.[chain.id]) {
+      return;
+    }
+    this.generatingPOIsForChain[chain.type] ??= [];
+    this.generatingPOIsForChain[chain.type][chain.id] = true;
+
+    try {
+      const { sentCommitmentsNeedPOIs, unshieldEventsNeedPOIs, TXOs } =
+        await this.getSentCommitmentsAndUnshieldEventsNeedPOIs(
+          txidVersion,
+          chain,
+          railgunTxidFilter,
+        );
+
+      if (!sentCommitmentsNeedPOIs.length && !unshieldEventsNeedPOIs.length) {
+        if (isDefined(railgunTxidFilter)) {
+          throw new Error(
+            `Railgun TXID ${railgunTxidFilter} not found in sent commitments / unshield events.`,
+          );
+        }
+        this.generatingPOIsForChain[chain.type][chain.id] = false;
+        return;
+      }
+
+      const railgunTxidsNeedPOIs = new Set<string>();
+      sentCommitmentsNeedPOIs.forEach((sentCommitment) => {
+        if (isDefined(sentCommitment.railgunTxid)) {
+          railgunTxidsNeedPOIs.add(sentCommitment.railgunTxid);
+        }
+      });
+      unshieldEventsNeedPOIs.forEach((unshieldEvent) => {
+        if (isDefined(unshieldEvent.railgunTxid)) {
+          railgunTxidsNeedPOIs.add(unshieldEvent.railgunTxid);
+        }
+      });
+      const railgunTxids = Array.from(railgunTxidsNeedPOIs);
+
+      if (isDefined(railgunTxidFilter) && !railgunTxids.includes(railgunTxidFilter)) {
+        throw new Error('Railgun TXID not found in sent commitments / unshield events.');
+      }
+
+      const txidMerkletree = this.getRailgunTXIDMerkletreeForChain(txidVersion, chain);
+
+      const generatePOIsDatas: GeneratePOIsData[] = [];
+
+      // eslint-disable-next-line no-restricted-syntax
+      for (const railgunTxid of railgunTxids) {
+        const txidMerkletreeData = await txidMerkletree.getRailgunTxidCurrentMerkletreeData(
+          railgunTxid,
+        );
+        const { railgunTransaction } = txidMerkletreeData;
+
+        const isLegacyPOIProof = railgunTransaction.blockNumber < txidMerkletree.poiLaunchBlock;
+        const spentTXOs = TXOs.filter((txo) =>
+          railgunTransaction.nullifiers.includes(`0x${txo.nullifier}`),
+        );
+        const listKeys = POI.getListKeysCanGenerateSpentPOIs(spentTXOs, isLegacyPOIProof);
+        if (!listKeys.length) {
+          continue;
+        }
+
+        // eslint-disable-next-line no-restricted-syntax
+        for (const listKey of listKeys) {
+          // Use this syntax to capture each index and totalCount.
+          generatePOIsDatas.push({
+            railgunTxid,
+            listKey,
+            isLegacyPOIProof,
+            spentTXOs,
+            txidMerkletreeData,
+            sentCommitments: sentCommitmentsNeedPOIs,
+            unshieldEvents: unshieldEventsNeedPOIs,
+          });
+        }
+      }
+
+      // eslint-disable-next-line no-restricted-syntax
+      for (let i = 0; i < generatePOIsDatas.length; i += 1) {
+        await this.generatePOIsForRailgunTxidAndListKey(
+          txidVersion,
+          chain,
+          generatePOIsDatas[i],
+          i,
+          generatePOIsDatas.length,
+        );
+      }
+    } catch (err) {
+      this.generatingPOIsForChain[chain.type][chain.id] = false;
+      throw err;
+    }
+  }
+
+  private async generatePOIsForRailgunTxidAndListKey(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    generatePOIsData: GeneratePOIsData,
+    index: number,
+    totalCount: number,
+  ): Promise<void> {
+    const {
+      railgunTxid,
+      listKey,
+      isLegacyPOIProof,
+      spentTXOs,
+      txidMerkletreeData,
+      sentCommitments,
+      unshieldEvents,
+    } = generatePOIsData;
+
+    try {
+      const { railgunTransaction } = txidMerkletreeData;
+      if (railgunTransaction.railgunTxid !== railgunTxid) {
+        throw new Error('Invalid railgun transaction data for proof');
+      }
+
+      // Spent TXOs
+      const blindedCommitmentsIn = removeUndefineds(spentTXOs.map((txo) => txo.blindedCommitment));
+      if (blindedCommitmentsIn.length !== railgunTransaction.nullifiers.length) {
+        throw new Error(
+          `Not enough TXO blinded commitments for railgun transaction nullifiers: expected ${railgunTransaction.nullifiers.length}, got ${blindedCommitmentsIn.length}`,
+        );
+      }
+
+      const listPOIMerkleProofs: MerkleProof[] = await AbstractWallet.getListPOIMerkleProofs(
+        txidVersion,
+        chain,
+        listKey,
+        blindedCommitmentsIn,
+        isLegacyPOIProof,
+      );
+
+      // Sent Commitments
+      const sentCommitmentsForRailgunTxid = sentCommitments.filter(
+        (sentCommitment) => sentCommitment.railgunTxid === railgunTxid,
+      );
+      const blindedCommitmentsOutSentCommitments = removeUndefineds(
+        sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.blindedCommitment),
+      );
+      // Unshield Events
+      const unshieldEventsForRailgunTxid = unshieldEvents.filter(
+        (unshieldEvent) => unshieldEvent.railgunTxid === railgunTxid,
+      );
+      if (unshieldEventsForRailgunTxid.length > 1) {
+        throw new Error('Cannot have more than 1 unshield event per railgun txid');
+      }
+
+      const hasUnshield = unshieldEventsForRailgunTxid.length > 0;
+
+      const commitmentsWithoutUnshields = hasUnshield
+        ? railgunTransaction.commitments.length - 1
+        : railgunTransaction.commitments.length;
+
+      // Use 0x00 if there is no unshield.
+      const railgunTxidIfHasUnshield = hasUnshield
+        ? getBlindedCommitmentForUnshield(railgunTxid)
+        : '0x00';
+
+      if (!sentCommitmentsForRailgunTxid.length && !unshieldEventsForRailgunTxid.length) {
+        throw new Error(`No sent commitments or unshield events for railgun txid: ${railgunTxid}`);
+      }
+
+      // Aggregate Sent + Unshields
+      const blindedCommitmentsOut: string[] = removeDuplicates([
+        ...blindedCommitmentsOutSentCommitments,
+        // Do not send blinded commitments for unshields.
+      ]);
+      if (blindedCommitmentsOut.length !== commitmentsWithoutUnshields) {
+        throw new Error(
+          `Not enough blinded commitments for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${blindedCommitmentsOut.length}`,
+        );
+      }
+
+      const npksOut: bigint[] = [
+        ...sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.note.notePublicKey),
+        // Do not send npks for unshields
+      ];
+      if (npksOut.length !== commitmentsWithoutUnshields) {
+        throw new Error(
+          `Invalid number of npksOut for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${npksOut.length}`,
+        );
+      }
+
+      const valuesOut: bigint[] = [
+        ...sentCommitmentsForRailgunTxid.map((sentCommitment) => sentCommitment.note.value),
+        // Do not send values for unshields
+      ];
+      if (valuesOut.length !== commitmentsWithoutUnshields) {
+        throw new Error(
+          `Invalid number of valuesOut for railgun txid commitments (without unshields): expected ${commitmentsWithoutUnshields}, got ${valuesOut.length}`,
+        );
+      }
+
+      const anyRailgunTxidMerklerootAfterTransaction =
+        txidMerkletreeData.currentMerkleProofForTree.root;
+
+      const poiProofInputs: POIEngineProofInputs = {
+        // --- Public inputs ---
+        anyRailgunTxidMerklerootAfterTransaction,
+
+        // --- Private inputs ---
+
+        // Railgun Transaction info
+        boundParamsHash: railgunTransaction.boundParamsHash,
+        nullifiers: railgunTransaction.nullifiers,
+        commitmentsOut: railgunTransaction.commitments,
+
+        // Spender wallet info
+        spendingPublicKey: this.spendingPublicKey,
+        nullifyingKey: this.nullifyingKey,
+
+        // Nullified notes data
+        token: spentTXOs[0].note.tokenHash,
+        randomsIn: spentTXOs.map((txo) => txo.note.random),
+        valuesIn: spentTXOs.map((txo) => txo.note.value),
+        utxoPositionsIn: spentTXOs.map((txo) => txo.position),
+        utxoTreeIn: spentTXOs[0].tree,
+
+        // Commitment notes data
+        npksOut,
+        valuesOut,
+        utxoTreeOut: railgunTransaction.utxoTreeOut,
+        utxoBatchStartPositionOut: railgunTransaction.utxoBatchStartPositionOut,
+        railgunTxidIfHasUnshield,
+
+        // Railgun txid tree
+        railgunTxidMerkleProofIndices: txidMerkletreeData.currentMerkleProofForTree.indices,
+        railgunTxidMerkleProofPathElements: txidMerkletreeData.currentMerkleProofForTree.elements,
+
+        // POI tree
+        poiMerkleroots: listPOIMerkleProofs.map((merkleProof) => merkleProof.root),
+        poiInMerkleProofIndices: listPOIMerkleProofs.map((merkleProof) => merkleProof.indices),
+        poiInMerkleProofPathElements: listPOIMerkleProofs.map(
+          (merkleProof) => merkleProof.elements,
+        ),
+      };
+
+      const { proof: snarkProof } = await this.prover.provePOI(
+        poiProofInputs,
+        listKey,
+        blindedCommitmentsOut,
+        (progress: number) => {
+          this.emitPOIProofUpdateEvent(
+            txidVersion,
+            chain,
+            progress,
+            listKey,
+            railgunTransaction.txid,
+            railgunTxid,
+            index,
+            totalCount,
+          );
+        },
+      );
+
+      await POI.submitPOI(
+        txidVersion,
+        chain,
+        listKey,
+        snarkProof,
+        poiProofInputs.poiMerkleroots,
+        anyRailgunTxidMerklerootAfterTransaction,
+        txidMerkletreeData.currentTxidIndexForTree,
+        blindedCommitmentsOut,
+        railgunTxidIfHasUnshield,
+      );
+    } catch (err) {
+      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-member-access
+      throw new Error(`Error generating POI - txid ${railgunTxid}: ${err.message}`);
+    }
+  }
+
+  private static async getListPOIMerkleProofs(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    listKey: string,
+    blindedCommitmentsIn: string[],
+    isLegacyPOIProof: boolean,
+  ): Promise<MerkleProof[]> {
+    if (isLegacyPOIProof) {
+      return blindedCommitmentsIn.map(createDummyMerkleProof);
+    }
+    return POI.getPOIMerkleProofs(txidVersion, chain, listKey, blindedCommitmentsIn);
+  }
+
+  private async updateReceiveCommitmentCreatedPOIs(
+    chain: Chain,
+    tree: number,
+    position: number,
+    poisPerList: POIsPerList,
+  ): Promise<void> {
+    const dbPath = this.getWalletReceiveCommitmentDBPrefix(chain, tree, position);
+    const data = (await this.db.get(dbPath)) as BytesData;
+    const receiveCommitment = msgpack.decode(arrayify(data)) as StoredReceiveCommitment;
+    receiveCommitment.poisPerList = poisPerList;
+    await this.updateReceiveCommitmentInDB(chain, tree, position, receiveCommitment);
+  }
+
+  private async updateSentCommitmentSpentPOIs(
+    chain: Chain,
+    tree: number,
+    position: number,
+    poisPerList: POIsPerList,
+  ): Promise<void> {
+    const dbPath = this.getWalletSentCommitmentDBPrefix(chain, tree, position);
+    const data = (await this.db.get(dbPath)) as BytesData;
+    const sentCommitment = msgpack.decode(arrayify(data)) as StoredSendCommitment;
+    sentCommitment.poisPerList = poisPerList;
+    await this.updateSentCommitmentInDB(chain, tree, position, sentCommitment);
   }
 
   private static getPossibleChangeTokenAmounts(
@@ -843,12 +1506,27 @@ abstract class AbstractWallet extends EventEmitter {
     chain: Chain,
     startingBlock: Optional<number>,
   ): Promise<TransactionHistoryEntry[]> {
-    const TXOs = await this.TXOs(chain);
+    const transactionHistory: TransactionHistoryEntry[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for (const txidVersion of ACTIVE_TXID_VERSIONS) {
+      transactionHistory.push(
+        ...(await this.getTransactionHistoryByTXIDVersion(txidVersion, chain, startingBlock)),
+      );
+    }
+    return transactionHistory;
+  }
+
+  private async getTransactionHistoryByTXIDVersion(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    startingBlock: Optional<number>,
+  ): Promise<TransactionHistoryEntry[]> {
+    const TXOs = await this.TXOs(txidVersion, chain);
     const filteredTXOs = AbstractWallet.filterTXOsByBlockNumber(TXOs, startingBlock);
 
     const [receiveHistory, spendHistory] = await Promise.all([
       AbstractWallet.getTransactionReceiveHistory(filteredTXOs),
-      this.getTransactionSpendHistory(chain, filteredTXOs, startingBlock),
+      this.getTransactionSpendHistory(txidVersion, chain, filteredTXOs, startingBlock),
     ]);
 
     const history: TransactionHistoryEntry[] = spendHistory.map((sendItem) => ({
@@ -978,21 +1656,29 @@ abstract class AbstractWallet extends EventEmitter {
     return TransactionHistoryItemVersion.UpdatedNov2022;
   }
 
-  async getAllUnshieldEventsFromSpentNullifiers(
+  /**
+   * NOTE: There are no Unshield events pre-V2.
+   */
+  async getUnshieldEventsFromSpentNullifiers(
+    txidVersion: TXIDVersion,
     chain: Chain,
     filteredTXOs: TXO[],
   ): Promise<UnshieldStoredEvent[]> {
-    const merkletree = this.getMerkletreeForChain(chain);
+    const merkletree = this.getUTXOMerkletree(txidVersion, chain);
     const unshieldEvents: UnshieldStoredEvent[] = [];
 
     const seenSpentTxids: string[] = [];
 
+    const spentTXOs = filteredTXOs.filter(
+      (txo) => isDefined(txo.spendtxid) && txo.spendtxid !== false,
+    );
+
     await Promise.all(
-      filteredTXOs.map(async ({ spendtxid, note }) => {
+      spentTXOs.map(async ({ spendtxid, note }) => {
         if (note.value === 0n) {
           return;
         }
-        if (spendtxid === false) {
+        if (spendtxid === false || !spendtxid) {
           return;
         }
         if (seenSpentTxids.includes(spendtxid)) {
@@ -1001,14 +1687,16 @@ abstract class AbstractWallet extends EventEmitter {
         seenSpentTxids.push(spendtxid);
 
         // Nullifier exists. Find unshield events from txid.
+
+        // NOTE: There are no Unshield events pre-V2.
         const unshieldEventsForNullifier = await merkletree.getUnshieldEvents(spendtxid);
-        const filteredEventsForNullifier = unshieldEventsForNullifier.filter(
+        const filteredUnshieldEventsForNullifier = unshieldEventsForNullifier.filter(
           (event) =>
             unshieldEvents.find((existingUnshieldEvent) =>
               AbstractWallet.compareUnshieldEvents(existingUnshieldEvent, event),
             ) == null,
         );
-        unshieldEvents.push(...filteredEventsForNullifier);
+        unshieldEvents.push(...filteredUnshieldEventsForNullifier);
       }),
     );
 
@@ -1020,13 +1708,14 @@ abstract class AbstractWallet extends EventEmitter {
   }
 
   async getTransactionSpendHistory(
+    txidVersion: TXIDVersion,
     chain: Chain,
     filteredTXOs: TXO[],
     startingBlock: Optional<number>,
   ): Promise<TransactionHistoryEntrySpent[]> {
     const [allUnshieldEvents, sentCommitments] = await Promise.all([
-      this.getAllUnshieldEventsFromSpentNullifiers(chain, filteredTXOs),
-      this.getSentCommitments(chain, startingBlock),
+      this.getUnshieldEventsFromSpentNullifiers(txidVersion, chain, filteredTXOs),
+      this.getSentCommitments(txidVersion, chain, startingBlock),
     ]);
 
     const txidTransactionMap: { [txid: string]: TransactionHistoryEntryPreprocessSpent } = {};
@@ -1168,10 +1857,18 @@ abstract class AbstractWallet extends EventEmitter {
     return history;
   }
 
-  private getMerkletreeForChain(chain: Chain): MerkleTree {
-    const merkletree = this.merkletrees[chain.type][chain.id];
+  getUTXOMerkletree(txidVersion: TXIDVersion, chain: Chain): UTXOMerkletree {
+    const merkletree = this.utxoMerkletrees[txidVersion]?.[chain.type]?.[chain.id];
     if (!isDefined(merkletree)) {
-      throw new Error(`No merkletree for chain ${chain.type}:${chain.id}`);
+      throw new Error(`No utxo merkletree for chain ${chain.type}:${chain.id}`);
+    }
+    return merkletree;
+  }
+
+  getRailgunTXIDMerkletreeForChain(txidVersion: TXIDVersion, chain: Chain): TXIDMerkletree {
+    const merkletree = this.txidMerkletrees[txidVersion]?.[chain.type]?.[chain.id];
+    if (!isDefined(merkletree)) {
+      throw new Error(`No txid merkletree for chain ${chain.type}:${chain.id}`);
     }
     return merkletree;
   }
@@ -1181,16 +1878,40 @@ abstract class AbstractWallet extends EventEmitter {
    * @param chain - chain type/id to get balances for
    * @returns balances
    */
-  async balances(chain: Chain): Promise<Balances> {
-    const TXOs = await this.TXOs(chain);
-    const balances: Balances = {};
+  async getAllBalances(chain: Chain): Promise<AllBalances> {
+    const balances: AllBalances = {};
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const txidVersion of ACTIVE_TXID_VERSIONS) {
+      const balancesByTxidVersion = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
+
+      Object.keys(balancesByTxidVersion).forEach((tokenHash) => {
+        balances[txidVersion] ??= {};
+        balances[txidVersion][tokenHash] = balancesByTxidVersion[tokenHash];
+      });
+    }
+
+    return balances;
+  }
+
+  /**
+   * Gets wallet balances
+   * @param chain - chain type/id to get balances for
+   * @returns balances
+   */
+  async getTokenBalancesByTxidVersion(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<TokenBalances> {
+    const TXOs = await this.TXOs(txidVersion, chain);
+    const tokenBalances: TokenBalances = {};
 
     // Loop through each TXO and add to balances if unspent
     TXOs.forEach((txo) => {
       const tokenHash = formatToByteLength(txo.note.tokenHash, ByteLength.UINT_256, false);
       // If we don't have an entry for this token yet, create one
-      if (!isDefined(balances[tokenHash])) {
-        balances[tokenHash] = {
+      if (!isDefined(tokenBalances[tokenHash])) {
+        tokenBalances[tokenHash] = {
           balance: BigInt(0),
           utxos: [],
           tokenData: txo.note.tokenData,
@@ -1200,18 +1921,23 @@ abstract class AbstractWallet extends EventEmitter {
       // If utxo is unspent process it
       if (txo.spendtxid === false) {
         // Store utxo
-        balances[tokenHash].utxos.push(txo);
+        tokenBalances[tokenHash].utxos.push(txo);
         // Increment balance
-        balances[tokenHash].balance += txo.note.value;
+        tokenBalances[tokenHash].balance += txo.note.value;
       }
     });
 
-    return balances;
+    return tokenBalances;
   }
 
-  async getBalance(chain: Chain, tokenAddress: string): Promise<Optional<bigint>> {
-    const balances = await this.balances(chain);
-    const balanceForToken = balances[formatToByteLength(tokenAddress, 32, false)];
+  async getBalanceERC20(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    tokenAddress: string,
+  ): Promise<Optional<bigint>> {
+    const balances = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
+    const tokenHash = getTokenDataHash(getTokenDataERC20(tokenAddress));
+    const balanceForToken = balances[tokenHash];
     return isDefined(balanceForToken) ? balanceForToken.balance : undefined;
   }
 
@@ -1220,39 +1946,47 @@ abstract class AbstractWallet extends EventEmitter {
    * @param chain - chain type/id of token
    * @returns balances by tree
    */
-  async balancesByTree(chain: Chain): Promise<BalancesByTree> {
+  async getTotalBalancesByTreeNumber(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+  ): Promise<TotalBalancesByTreeNumber> {
     // Fetch balances
-    const balances = await this.balances(chain);
+    const tokenBalances = await this.getTokenBalancesByTxidVersion(txidVersion, chain);
 
     // Sort token balances by tree
-    const balancesByTree: BalancesByTree = {};
+    const totalBalancesByTreeNumber: TotalBalancesByTreeNumber = {};
 
     // Loop through each token
-    Object.keys(balances).forEach((token) => {
+
+    Object.keys(tokenBalances).forEach((tokenHash) => {
       // Create balances tree array
-      balancesByTree[token] = [];
+      totalBalancesByTreeNumber[tokenHash] = [];
 
       // Loop through each TXO and sort by tree
-      balances[token].utxos.forEach((utxo) => {
-        if (!isDefined(balancesByTree[token][utxo.tree])) {
-          balancesByTree[token][utxo.tree] = {
+      tokenBalances[tokenHash].utxos.forEach((utxo) => {
+        if (!isDefined(totalBalancesByTreeNumber[tokenHash][utxo.tree])) {
+          totalBalancesByTreeNumber[tokenHash][utxo.tree] = {
             balance: utxo.note.value,
             utxos: [utxo],
             tokenData: utxo.note.tokenData,
           };
         } else {
-          balancesByTree[token][utxo.tree].balance += utxo.note.value;
-          balancesByTree[token][utxo.tree].utxos.push(utxo);
+          totalBalancesByTreeNumber[tokenHash][utxo.tree].balance += utxo.note.value;
+          totalBalancesByTreeNumber[tokenHash][utxo.tree].utxos.push(utxo);
         }
       });
     });
 
-    return balancesByTree;
+    return totalBalancesByTreeNumber;
   }
 
-  async balancesByTreeForToken(chain: Chain, tokenHash: string): Promise<TreeBalance[]> {
-    const balances = await this.balancesByTree(chain);
-    const treeSortedBalances = balances[tokenHash] ?? [];
+  async balancesByTreeForToken(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    tokenHash: string,
+  ): Promise<TreeBalance[]> {
+    const totalBalancesByTreeNumber = await this.getTotalBalancesByTreeNumber(txidVersion, chain);
+    const treeSortedBalances = totalBalancesByTreeNumber[tokenHash] ?? [];
     return treeSortedBalances;
   }
 
@@ -1264,20 +1998,25 @@ abstract class AbstractWallet extends EventEmitter {
     return tokenBalance;
   }
 
-  /**
-   * Scans for new balances
-   * @param chain - chain data to scan
-   */
-  async scanBalances(chain: Chain, progressCallback: Optional<(progress: number) => void>) {
+  async scanBalances(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    progressCallback: Optional<(progress: number) => void>,
+  ) {
     EngineDebug.log(`scan wallet balances: chain ${chain.type}:${chain.id}`);
 
-    const merkletree = this.getMerkletreeForChain(chain);
+    const utxoMerkletree = this.getUTXOMerkletree(txidVersion, chain);
 
+    // eslint-disable-next-line no-useless-catch
     try {
+      if (txidVersion !== TXIDVersion.V2_PoseidonMerkle) {
+        throw new Error('Wallet details will be incorrect for this TXID version - needs migration');
+      }
+
       // Fetch wallet details and latest tree.
       const [walletDetails, latestTree] = await Promise.all([
-        this.getWalletDetails(chain),
-        merkletree.latestTree(),
+        this.getWalletDetails(txidVersion, chain),
+        utxoMerkletree.latestTree(),
       ]);
 
       // Fill list of tree heights with 0s up to # of trees
@@ -1293,7 +2032,7 @@ abstract class AbstractWallet extends EventEmitter {
       ) {
         const creationBlockNumber = this.creationBlockNumbers[chain.type][chain.id];
         const creationTreeInfo = await AbstractWallet.getTreeAndPositionBeforeBlock(
-          merkletree,
+          utxoMerkletree,
           latestTree,
           creationBlockNumber,
         );
@@ -1321,12 +2060,12 @@ abstract class AbstractWallet extends EventEmitter {
         }
 
         // Create sparse array of tree
-        const treeHeight = await merkletree.getTreeLength(treeIndex);
+        const treeHeight = await utxoMerkletree.getTreeLength(treeIndex);
         const fetcher = new Array<Promise<Optional<Commitment>>>(treeHeight);
 
         // Fetch each leaf we need to scan
         for (let index = startScanHeight; index < treeHeight; index += 1) {
-          fetcher[index] = merkletree.getCommitment(treeIndex, index);
+          fetcher[index] = utxoMerkletree.getCommitment(treeIndex, index);
         }
 
         // Wait until all leaves are fetched
@@ -1337,21 +2076,29 @@ abstract class AbstractWallet extends EventEmitter {
         let timeSinceLastProgressCallback = Date.now() - 500;
 
         // Start scanning primary and change
-        await this.scanLeaves(leaves, treeIndex, chain, startScanHeight, treeHeight, () => {
-          // Scan ticker. Triggers every time leaf is scanned successfully or skipped.
-          if (progressCallback) {
-            // Throttle progressCallback, at most every 500ms.
-            if (Date.now() - timeSinceLastProgressCallback >= 500) {
-              // 100ms since last progressCallback call.
-              timeSinceLastProgressCallback = Date.now();
-              const finishedTreeCount = treeIndex - startScanTree;
-              const finishedTreesProgress = finishedTreeCount / treesToScan;
-              finishedLeafCount += 1;
-              const newTreeProgress = finishedLeafCount / leavesToScan / treesToScan;
-              progressCallback(finishedTreesProgress + newTreeProgress);
+        await this.scanLeaves(
+          txidVersion,
+          leaves,
+          treeIndex,
+          chain,
+          startScanHeight,
+          treeHeight,
+          () => {
+            // Scan ticker. Triggers every time leaf is scanned successfully or skipped.
+            if (progressCallback) {
+              // Throttle progressCallback, at most every 500ms.
+              if (Date.now() - timeSinceLastProgressCallback >= 500) {
+                // 100ms since last progressCallback call.
+                timeSinceLastProgressCallback = Date.now();
+                const finishedTreeCount = treeIndex - startScanTree;
+                const finishedTreesProgress = finishedTreeCount / treesToScan;
+                finishedLeafCount += 1;
+                const newTreeProgress = finishedLeafCount / leavesToScan / treesToScan;
+                progressCallback(finishedTreesProgress + newTreeProgress);
+              }
             }
-          }
-        });
+          },
+        );
 
         // Commit new scanned height
         walletDetails.treeScannedHeights[treeIndex] = leaves.length;
@@ -1362,22 +2109,62 @@ abstract class AbstractWallet extends EventEmitter {
 
       // Emit scanned event for this chain
       EngineDebug.log(`wallet: scanned ${chain.type}:${chain.id}`);
-      this.emit(EngineEvent.WalletScanComplete, { chain } as WalletScannedEventData);
+      const walletScannedEventData: WalletScannedEventData = { txidVersion, chain };
+      this.emit(EngineEvent.WalletScanComplete, walletScannedEventData);
+
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.refreshPOIsForAllTXIDVersions(chain); // Synchronous
     } catch (err) {
       if (err instanceof Error) {
         EngineDebug.log(`wallet.scan error: ${err.message}`);
-        EngineDebug.error(err);
+        EngineDebug.error(err, true /* ignoreInTests */);
       }
     }
   }
 
   /**
+   * Occurs after balances are scanned.
+   */
+  async refreshPOIsForAllTXIDVersions(chain: Chain) {
+    if (!POI.isActiveForChain(chain)) {
+      return;
+    }
+    if (this.isRefreshingPOIs[chain.type]?.[chain.id]) {
+      return;
+    }
+    this.isRefreshingPOIs[chain.type] ??= [];
+    this.isRefreshingPOIs[chain.type][chain.id] = true;
+
+    try {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const txidVersion of ACTIVE_TXID_VERSIONS) {
+        // Refresh POIs - Receive commitments
+        await this.refreshReceivePOIsAllTXOs(txidVersion, chain);
+
+        // Refresh POIs - Sent commitments / unshields
+        await this.refreshSpentPOIsAllSentCommitmentsAndUnshieldEvents(txidVersion, chain);
+
+        // Generate POIs - Sent commitments / unshields
+        // TODO - add this after manual testing
+        // await this.generatePOIsAllSentCommitmentsAndUnshieldEvents(txidVersion, chain);
+      }
+
+      this.isRefreshingPOIs[chain.type][chain.id] = false;
+    } catch (err) {
+      this.isRefreshingPOIs[chain.type][chain.id] = false;
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+      EngineDebug.error(err, true /* ignoreInTests */);
+      throw err;
+    }
+  }
+
+  /**
    * Searches for creation tree height for given merkletree.
-   * @param merkletree - MerkleTree
+   * @param merkletree - Merkletree
    * @param latestTree - number
    */
   static async getTreeAndPositionBeforeBlock(
-    merkletree: MerkleTree,
+    utxoMerkletree: UTXOMerkletree,
     latestTree: number,
     creationBlockNumber: number,
   ): Promise<Optional<{ tree: number; position: number }>> {
@@ -1387,12 +2174,12 @@ abstract class AbstractWallet extends EventEmitter {
 
     // Loop through each tree, descending, and search commitments for creation tree height <= block number
     for (let tree = latestTree; tree > -1; tree -= 1) {
-      const treeHeight = await merkletree.getTreeLength(tree);
+      const treeHeight = await utxoMerkletree.getTreeLength(tree);
       const fetcher = new Array<Promise<Optional<Commitment>>>(treeHeight);
 
       // Build reverse list.
       for (let index = 0; index < treeHeight; index += 1) {
-        fetcher[index] = merkletree.getCommitment(tree, index);
+        fetcher[index] = utxoMerkletree.getCommitment(tree, index);
       }
 
       const leaves = await Promise.all(fetcher);
@@ -1409,9 +2196,8 @@ abstract class AbstractWallet extends EventEmitter {
           commitment.blockNumber <= creationBlockNumber,
       );
 
-      if (creationBlockIndex === -1) {
-        // First index in the tree.
-        return { tree, position: 0 };
+      if (creationBlockIndex > -1) {
+        return { tree, position: creationBlockIndex };
       }
     }
 
@@ -1426,13 +2212,15 @@ abstract class AbstractWallet extends EventEmitter {
    * Clears balances scanned from merkletrees and stored to database.
    * @param chain - chain type/id to clear
    */
-  async clearScannedBalances(chain: Chain) {
-    const walletDetails = await this.getWalletDetails(chain);
-    walletDetails.treeScannedHeights = [];
+  async clearScannedBalances(txidVersion: TXIDVersion, chain: Chain) {
+    const walletDetails = await this.getWalletDetails(txidVersion, chain);
     this.cachedReceiveCommitments = [];
+
     // Clear namespace and then resave the walletDetails
     const namespace = this.getWalletDetailsPath(chain);
     await this.db.clearNamespace(namespace);
+
+    walletDetails.treeScannedHeights = [];
     await this.db.put(this.getWalletDetailsPath(chain), msgpack.encode(walletDetails));
   }
 
@@ -1440,12 +2228,16 @@ abstract class AbstractWallet extends EventEmitter {
    * Clears stored balances and re-scans fully.
    * @param chain - chain type/id to rescan
    */
-  async fullRescanBalances(chain: Chain, progressCallback: Optional<(progress: number) => void>) {
-    await this.clearScannedBalances(chain);
-    return this.scanBalances(chain, progressCallback);
+  async fullRescanBalances(
+    txidVersion: TXIDVersion,
+    chain: Chain,
+    progressCallback: Optional<(progress: number) => void>,
+  ) {
+    await this.clearScannedBalances(txidVersion, chain);
+    return this.scanBalances(txidVersion, chain, progressCallback);
   }
 
-  abstract sign(publicInputs: PublicInputs, encryptionKey: string): Promise<Signature>;
+  abstract sign(publicInputs: PublicInputsRailgun, encryptionKey: string): Promise<Signature>;
 
   static dbPath(id: string): BytesData[] {
     return [fromUTF8String('wallet'), id];

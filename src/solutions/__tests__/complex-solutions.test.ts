@@ -8,7 +8,7 @@ import {
 } from '../complex-solutions';
 import { filterZeroUTXOs, sortUTXOsByAscendingValue } from '../utxos';
 import { TransactionBatch } from '../../transaction/transaction-batch';
-import { OutputType } from '../../models/formatted-types';
+import { CommitmentType, OutputType } from '../../models/formatted-types';
 import { extractSpendingSolutionGroupsData } from '../spending-group-extractor';
 import { randomHex } from '../../utils/bytes';
 import { getPublicViewingKey } from '../../utils/keys-utils';
@@ -17,8 +17,9 @@ import { AddressData } from '../../key-derivation/bech32';
 import { ViewingKeyPair } from '../../key-derivation/wallet-node';
 import { TransactNote } from '../../note/transact-note';
 import { RailgunEngine } from '../../railgun-engine';
-import { TXO, TreeBalance } from '../../models';
 import { getTokenDataERC20 } from '../../note/note-util';
+import { TXO } from '../../models/txo-types';
+import { TreeBalance } from '../../models/wallet-types';
 
 const addressData1 = RailgunEngine.decodeAddress(
   '0zk1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqunpd9kxwatwqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqhshkca',
@@ -51,7 +52,6 @@ const createMockNote = async (addressData: AddressData, value: bigint) => {
   return TransactNote.createTransfer(
     addressData,
     undefined,
-    randomHex(16),
     value,
     tokenData,
     viewingKeyPair,
@@ -70,10 +70,14 @@ const createMockTXO = async (txid: string, value: bigint): Promise<TXO> => {
     position: MOCK_POSITION,
     tree: 0,
     spendtxid: false,
+    poisPerList: undefined,
+    blindedCommitment: undefined,
+    commitmentType: CommitmentType.TransactCommitment,
+    nullifier: randomHex(32),
   };
 };
 
-describe('Solutions/Complex Solutions', () => {
+describe('complex-solutions', () => {
   it('Should get valid next nullifier targets', () => {
     expect(nextNullifierTarget(0)).to.equal(1);
     expect(nextNullifierTarget(1)).to.equal(2);

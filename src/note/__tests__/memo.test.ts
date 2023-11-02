@@ -7,6 +7,8 @@ import WalletInfo from '../../wallet/wallet-info';
 import { config } from '../../test/config.test';
 import { Database } from '../../database/database';
 import { RailgunWallet } from '../../wallet/railgun-wallet';
+import { Prover } from '../../prover/prover';
+import { testArtifactsGetter } from '../../test/helper.test';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
@@ -17,7 +19,7 @@ const testEncryptionKey = config.encryptionKey;
 let db: Database;
 let wallet: RailgunWallet;
 
-describe('Memo', function run() {
+describe('memo', function run() {
   this.beforeAll(async () => {
     db = new Database(memdown());
     wallet = await RailgunWallet.fromMnemonic(
@@ -26,6 +28,7 @@ describe('Memo', function run() {
       testMnemonic,
       0,
       undefined, // creationBlockNumbers
+      new Prover(testArtifactsGetter),
     );
     WalletInfo.setWalletSource('Memo Wallet');
   });

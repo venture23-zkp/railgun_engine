@@ -2,6 +2,7 @@ import chai from 'chai';
 import chaiAsPromised from 'chai-as-promised';
 import memdown from 'memdown';
 import { randomBytes } from 'ethers';
+import Sinon from 'sinon';
 import { ContractStore } from '../../contracts/contract-store';
 import { RailgunSmartWalletContract } from '../../contracts/railgun-smart-wallet/railgun-smart-wallet';
 import { Database } from '../../database/database';
@@ -313,7 +314,7 @@ let db: Database;
 let tokenDataGetter: TokenDataGetter;
 let chain: Chain;
 
-describe('Note/TransactNote', () => {
+describe('transact-note', () => {
   beforeEach(() => {
     db = new Database(memdown());
     chain = {
@@ -354,10 +355,12 @@ describe('Note/TransactNote', () => {
 
         const tokenData = getTokenDataERC20(vector.note.token);
 
+        const stubRandom = Sinon.stub(TransactNote, 'getNoteRandom').returns(vector.note.random);
+
         const note = TransactNote.createTransfer(
           address,
           address,
-          vector.note.random,
+
           hexToBigInt(vector.note.amount),
           tokenData,
           viewingKeyPair,
@@ -365,6 +368,8 @@ describe('Note/TransactNote', () => {
           OutputType.RelayerFee,
           'something', // memoText
         );
+
+        stubRandom.restore();
 
         const sharedKeyBytes = hexStringToBytes(vector.sharedKey);
 

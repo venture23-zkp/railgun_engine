@@ -1,4 +1,5 @@
 import BN from 'bn.js';
+import { POIsPerList } from './poi-types';
 
 export type BytesData = ArrayLike<number> | string | BN;
 
@@ -128,6 +129,8 @@ type CommitmentShared = {
   txid: string;
   blockNumber: number;
   timestamp: Optional<number>;
+  utxoTree: number;
+  utxoIndex: number;
 };
 
 export type ShieldCommitment = CommitmentShared & {
@@ -141,6 +144,32 @@ export type ShieldCommitment = CommitmentShared & {
 export type TransactCommitment = CommitmentShared & {
   commitmentType: CommitmentType.TransactCommitment;
   ciphertext: CommitmentCiphertext;
+  railgunTxid: Optional<string>;
+};
+
+export type RailgunTransaction = {
+  graphID: string;
+  commitments: string[];
+  nullifiers: string[];
+  boundParamsHash: string;
+  blockNumber: number;
+  txid: string;
+  unshieldTokenHash: Optional<string>;
+  hasUnshield: boolean;
+  utxoTreeIn: number;
+  utxoTreeOut: number;
+  utxoBatchStartPositionOut: number;
+};
+
+export type RailgunTransactionWithHash = RailgunTransaction & {
+  railgunTxid: string;
+  hash: string;
+};
+
+export type TXIDMerkletreeData = {
+  railgunTransaction: RailgunTransactionWithHash;
+  currentMerkleProofForTree: MerkleProof;
+  currentTxidIndexForTree: number;
 };
 
 export type Commitment =
@@ -164,6 +193,9 @@ export type StoredReceiveCommitment = {
   nullifier: string;
   decrypted: NoteSerialized | LegacyNoteSerialized;
   senderAddress: Optional<string>;
+  commitmentType: CommitmentType;
+  poisPerList: Optional<POIsPerList>;
+  blindedCommitment: Optional<string>;
 };
 
 // !! DO NOT MODIFY THIS TYPE - IT IS STORED IN DB WITH THESE EXACT KEYS !!
@@ -171,8 +203,12 @@ export type StoredSendCommitment = {
   txid: string;
   timestamp: Optional<number>;
   decrypted: NoteSerialized | LegacyNoteSerialized;
+  commitmentType: CommitmentType;
   noteExtraData?: NoteAnnotationData;
   recipientAddress: string;
+  railgunTxid: Optional<string>;
+  poisPerList: Optional<POIsPerList>;
+  blindedCommitment: Optional<string>;
 };
 
 /**
@@ -195,6 +231,7 @@ export type LegacyCommitmentCiphertext = {
 export type LegacyEncryptedCommitment = CommitmentShared & {
   commitmentType: CommitmentType.LegacyEncryptedCommitment;
   ciphertext: LegacyCommitmentCiphertext;
+  railgunTxid: Optional<string>;
 };
 
 export type CommitmentSummary = {
@@ -209,4 +246,11 @@ export type RelayAdaptShieldNFTRecipient = {
   recipientAddress: string;
   // support '0' id and 0 amount for minting access-card-nft
   amount: bigint;
+};
+
+export type POICommitmentOutData = {
+  blindedCommitmentsOut: string[];
+  npksOut: bigint[];
+  valuesOut: bigint[];
+  poisPerList: Optional<POIsPerList>;
 };

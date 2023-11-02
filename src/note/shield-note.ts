@@ -1,9 +1,8 @@
 import { poseidon } from 'circomlibjs';
 import { bytesToHex } from 'ethereum-cryptography/utils';
 import { ShieldCiphertext, TokenData } from '../models/formatted-types';
-import { getPublicViewingKey, getSharedSymmetricKey } from '../utils';
+import { AES, getPublicViewingKey, getSharedSymmetricKey } from '../utils';
 import { ByteLength, combine, hexlify, hexToBigInt, nToHex } from '../utils/bytes';
-import { aes } from '../utils/encryption';
 import { assertValidNoteRandom, assertValidNoteToken, getTokenDataHash } from './note-util';
 import { ShieldRequestStruct } from '../abi/typechain/RailgunSmartWallet';
 
@@ -20,8 +19,6 @@ export abstract class ShieldNote {
 
   readonly notePublicKey: bigint;
 
-  readonly hash: bigint;
-
   constructor(masterPublicKey: bigint, random: string, value: bigint, tokenData: TokenData) {
     assertValidNoteRandom(random);
     assertValidNoteToken(tokenData, value);
@@ -31,8 +28,7 @@ export abstract class ShieldNote {
     this.tokenData = tokenData;
     this.tokenHash = getTokenDataHash(tokenData);
     this.value = value;
-    this.notePublicKey = this.getNotePublicKey();
-    this.hash = this.getHash();
+    this.notePublicKey = ShieldNote.getNotePublicKey(masterPublicKey, random);
   }
 
   /**
@@ -44,21 +40,22 @@ export abstract class ShieldNote {
     return 'RAILGUN_SHIELD';
   }
 
-  private getNotePublicKey(): bigint {
-    return poseidon([this.masterPublicKey, hexToBigInt(this.random)]);
+  static getNotePublicKey(masterPublicKey: bigint, random: string): bigint {
+    return poseidon([masterPublicKey, hexToBigInt(random)]);
   }
 
-  /**
-   * Get note hash
-   */
-  private getHash(): bigint {
-    return poseidon([this.notePublicKey, hexToBigInt(this.tokenHash), this.value]);
+  static getShieldNoteHash(
+    notePublicKey: bigint,
+    tokenHash: string,
+    valueAfterFee: bigint,
+  ): bigint {
+    return poseidon([notePublicKey, hexToBigInt(tokenHash), valueAfterFee]);
   }
 
   static decryptRandom(encryptedBundle: [string, string, string], sharedKey: Uint8Array): string {
     const hexlified0 = hexlify(encryptedBundle[0]);
     const hexlified1 = hexlify(encryptedBundle[1]);
-    const decrypted = aes.gcm.decrypt(
+    const decrypted = AES.decryptGCM(
       {
         iv: hexlified0.slice(0, 32),
         tag: hexlified0.slice(16, 64),
@@ -86,10 +83,10 @@ export abstract class ShieldNote {
     }
 
     // Encrypt random
-    const encryptedRandom = aes.gcm.encrypt([this.random], sharedKey);
+    const encryptedRandom = AES.encryptGCM([this.random], sharedKey);
 
     // Encrypt receiver public key
-    const encryptedReceiver = aes.ctr.encrypt(
+    const encryptedReceiver = AES.encryptCTR(
       [bytesToHex(receiverViewingPublicKey)],
       shieldPrivateKey,
     );

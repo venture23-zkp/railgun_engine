@@ -1,16 +1,16 @@
 import { expect } from 'chai';
-import { PublicInputs } from '../../models/prover-types';
+import { PublicInputsRailgun } from '../../models/prover-types';
 import { testArtifactsGetter } from '../../test/helper.test';
 import { VALID_INPUT_COUNTS, VALID_OUTPUT_COUNTS } from '../nullifiers';
 
-describe('Solutions/Simple Solutions', () => {
+describe('simple-solutions', () => {
   it('Should test basic artifacts exist for each valid input/output', async () => {
     const invalidNullifiers = 1;
     const invalidCommitments = 6;
     expect(() =>
       testArtifactsGetter.assertArtifactExists(invalidNullifiers, invalidCommitments),
     ).to.throw('No artifacts for inputs: 1-6');
-    const publicInputs: PublicInputs = {
+    const publicInputs: PublicInputsRailgun = {
       nullifiers: new Array<bigint>(invalidNullifiers),
       commitmentsOut: new Array<bigint>(invalidCommitments),
       merkleRoot: 0n,

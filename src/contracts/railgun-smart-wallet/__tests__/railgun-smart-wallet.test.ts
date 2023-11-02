@@ -22,6 +22,10 @@ import {
   awaitScan,
   DECIMALS_18,
   getEthersWallet,
+  mockGetLatestValidatedRailgunTxid,
+  mockQuickSyncEvents,
+  mockQuickSyncRailgunTransactions,
+  mockRailgunTxidMerklerootValidator,
   sendTransactionWithLatestNonce,
   testArtifactsGetter,
 } from '../../../test/helper.test';
@@ -37,11 +41,12 @@ import {
   CommitmentEvent,
   EngineEvent,
   MerkletreeHistoryScanEventData,
+  MerkletreeScanStatus,
   UnshieldStoredEvent,
 } from '../../../models/event-types';
 import { Memo } from '../../../note/memo';
 import { ViewOnlyWallet } from '../../../wallet/view-only-wallet';
-import { Groth16 } from '../../../prover/prover';
+import { SnarkJSGroth16 } from '../../../prover/prover';
 import { promiseTimeout } from '../../../utils/promises';
 import { Chain, ChainType } from '../../../models/engine-types';
 import { RailgunEngine } from '../../../railgun-engine';
@@ -65,9 +70,12 @@ import { ShieldRequestStruct } from '../../../abi/typechain/RailgunSmartWallet';
 import { PollingJsonRpcProvider } from '../../../provider/polling-json-rpc-provider';
 import { createPollingJsonRpcProviderForListeners } from '../../../provider/polling-util';
 import { isDefined } from '../../../utils/is-defined';
+import { TXIDVersion } from '../../../models/poi-types';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
+
+const txidVersion = TXIDVersion.V2_PoseidonMerkle;
 
 let provider: PollingJsonRpcProvider;
 let chain: Chain;
@@ -91,20 +99,23 @@ const VALUE = BigInt(10000) * DECIMALS_18;
 
 let testShield: (value?: bigint) => Promise<TransactionReceipt | null>;
 
-describe('Railgun Smart Wallet', function runTests() {
+describe('railgun-smart-wallet', function runTests() {
   this.timeout(20000);
 
   beforeEach(async () => {
-    engine = new RailgunEngine(
+    engine = RailgunEngine.initForWallet(
       'Test RSW',
       memdown(),
       testArtifactsGetter,
-      undefined, // quickSync
+      mockQuickSyncEvents,
+      mockQuickSyncRailgunTransactions,
+      mockRailgunTxidMerklerootValidator,
+      mockGetLatestValidatedRailgunTxid,
       undefined, // engineDebugger
       undefined, // skipMerkletreeScans
     );
 
-    engine.prover.setSnarkJSGroth16(groth16 as Groth16);
+    engine.prover.setSnarkJSGroth16(groth16 as SnarkJSGroth16);
 
     if (!isDefined(process.env.RUN_HARDHAT_TESTS)) {
       return;
@@ -122,6 +133,7 @@ describe('Railgun Smart Wallet', function runTests() {
       config.contracts.relayAdapt,
       provider,
       pollingProvider,
+      { [TXIDVersion.V2_PoseidonMerkle]: 0 },
       0,
     );
     await engine.scanHistory(chain);
@@ -169,7 +181,12 @@ describe('Railgun Smart Wallet', function runTests() {
     const nonPollingProvider = new JsonRpcProvider(config.rpc);
     expect(() => {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      return new RailgunSmartWalletContract('abc', nonPollingProvider as any, nonPollingProvider as any, chain);
+      return new RailgunSmartWalletContract(
+        'abc',
+        nonPollingProvider as any,
+        nonPollingProvider as any,
+        chain,
+      );
     }).to.throw(
       'The JsonRpcProvider must have polling enabled. Use PollingJsonRpcProvider to instantiate.',
     );
@@ -217,7 +234,6 @@ describe('Railgun Smart Wallet', function runTests() {
     const nullRelayerFeeOutput = TransactNote.createTransfer(
       wallet2.addressKeys,
       wallet.addressKeys,
-      RANDOM,
       0n,
       tokenData,
       wallet.getViewingKeyPair(),
@@ -228,7 +244,6 @@ describe('Railgun Smart Wallet', function runTests() {
     const actualRelayerFeeOutput = TransactNote.createTransfer(
       wallet2.addressKeys,
       wallet.addressKeys,
-      RANDOM,
       300n,
       tokenData,
       wallet.getViewingKeyPair(),
@@ -239,7 +254,6 @@ describe('Railgun Smart Wallet', function runTests() {
     const nftTransferOutput = TransactNote.createERC721Transfer(
       wallet2.addressKeys,
       wallet.addressKeys,
-      RANDOM,
       shield.tokenData as NFTTokenData,
       wallet.getViewingKeyPair(),
       false, // showSenderAddressToRecipient
@@ -252,6 +266,7 @@ describe('Railgun Smart Wallet', function runTests() {
     const txs_initial = await initialTransactionBatch.generateTransactions(
       engine.prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
       () => {},
     );
@@ -270,6 +285,7 @@ describe('Railgun Smart Wallet', function runTests() {
       await transactionBatch_DummyNullRelayerFee.generateDummyTransactions(
         engine.prover,
         wallet,
+        txidVersion,
         testEncryptionKey,
       );
     expect(txs_DummyNullRelayerFee.length).to.equal(2);
@@ -306,6 +322,7 @@ describe('Railgun Smart Wallet', function runTests() {
       await transactionBatch_DummyActualRelayerFee.generateDummyTransactions(
         engine.prover,
         wallet,
+        txidVersion,
         testEncryptionKey,
       );
     expect(txs_DummyActualRelayerFee.length).to.equal(2);
@@ -340,6 +357,7 @@ describe('Railgun Smart Wallet', function runTests() {
     const txs_ActualTransaction = await transactionBatch_ActualTransaction.generateTransactions(
       engine.prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
       () => {},
     );
@@ -388,13 +406,13 @@ describe('Railgun Smart Wallet', function runTests() {
       return;
     }
     expect(
-      await railgunSmartWalletContract.validateRoot(
+      await railgunSmartWalletContract.validateMerkleroot(
         0,
         '0x14fceeac99eb8419a2796d1958fc2050d489bf5a3eb170ef16a667060344ba90',
       ),
     ).to.equal(true);
     expect(
-      await railgunSmartWalletContract.validateRoot(
+      await railgunSmartWalletContract.validateMerkleroot(
         0,
         '0x09981e69d3ecf345fb3e2e48243889aa4ff906423d6a686005cac572a3a9632d',
       ),
@@ -420,15 +438,18 @@ describe('Railgun Smart Wallet', function runTests() {
     }
 
     let resultEvent!: Optional<CommitmentEvent>;
-    const eventsListener = async (commitmentEvent: CommitmentEvent) => {
+    const eventsListener = async (_txidVersion: TXIDVersion, commitmentEvent: CommitmentEvent) => {
       resultEvent = commitmentEvent;
     };
     let resultNullifiers: Nullifier[] = [];
-    const nullifiersListener = async (nullifiers: Nullifier[]) => {
+    const nullifiersListener = async (_txidVersion: TXIDVersion, nullifiers: Nullifier[]) => {
       resultNullifiers.push(...nullifiers);
     };
     let resultUnshields: UnshieldStoredEvent[] = [];
-    const unshieldListener = async (unshields: UnshieldStoredEvent[]) => {
+    const unshieldListener = async (
+      _txidVersion: TXIDVersion,
+      unshields: UnshieldStoredEvent[],
+    ) => {
       resultUnshields.push(...unshields);
     };
 
@@ -469,7 +490,7 @@ describe('Railgun Smart Wallet', function runTests() {
       chain,
       startingBlock,
       latestBlock,
-      () => engine.getNextStartingBlockSlowScan(chain),
+      () => engine.getNextStartingBlockSlowScan(txidVersion, chain),
       eventsListener,
       nullifiersListener,
       unshieldListener,
@@ -493,7 +514,6 @@ describe('Railgun Smart Wallet', function runTests() {
       TransactNote.createTransfer(
         wallet2.addressKeys,
         wallet.addressKeys,
-        RANDOM,
         300n,
         tokenData,
         wallet.getViewingKeyPair(),
@@ -510,6 +530,7 @@ describe('Railgun Smart Wallet', function runTests() {
     const serializedTxs = await transactionBatch.generateTransactions(
       engine.prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
       () => {},
     );
@@ -523,8 +544,12 @@ describe('Railgun Smart Wallet', function runTests() {
       promiseTimeout(awaitMultipleScans(viewOnlyWallet, chain, 2), 15000, 'Timed out wallet1 scan'),
     ]);
 
-    expect(await wallet.getBalance(chain, TOKEN_ADDRESS)).equal(109724999999999999999600n);
-    expect(await viewOnlyWallet.getBalance(chain, TOKEN_ADDRESS)).equal(109724999999999999999600n);
+    expect(await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(
+      109724999999999999999600n,
+    );
+    expect(await viewOnlyWallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(
+      109724999999999999999600n,
+    );
 
     // Event should have been scanned by automatic contract events:
 
@@ -547,7 +572,7 @@ describe('Railgun Smart Wallet', function runTests() {
       chain,
       startingBlock,
       latestBlock,
-      () => engine.getNextStartingBlockSlowScan(chain),
+      () => engine.getNextStartingBlockSlowScan(txidVersion, chain),
       eventsListener,
       nullifiersListener,
       unshieldListener,
@@ -598,6 +623,7 @@ describe('Railgun Smart Wallet', function runTests() {
     const serializedTxs = await transactionBatch.generateTransactions(
       engine.prover,
       wallet,
+      txidVersion,
       testEncryptionKey,
       () => {},
     );
@@ -610,7 +636,7 @@ describe('Railgun Smart Wallet', function runTests() {
       promiseTimeout(awaitMultipleScans(wallet, chain, 2), 15000, 'Timed out wallet1 scan'),
     ]);
 
-    expect(await wallet.getBalance(chain, TOKEN_ADDRESS)).equal(0n);
+    expect(await wallet.getBalanceERC20(txidVersion, chain, TOKEN_ADDRESS)).equal(0n);
 
     const history = await wallet.getTransactionHistory(chain, startingBlock);
 
@@ -683,24 +709,26 @@ describe('Railgun Smart Wallet', function runTests() {
 
     const tree = 0;
 
-    const merkletree = engine.merkletrees[chain.type][chain.id];
+    const utxoMerkletree = engine.getUTXOMerkletree(TXIDVersion.V2_PoseidonMerkle, chain);
 
-    expect(await merkletree.getTreeLength(tree)).to.equal(1);
+    expect(await utxoMerkletree.getTreeLength(tree)).to.equal(1);
     let historyScanCompletedForChain!: Chain;
     const historyScanListener = (data: MerkletreeHistoryScanEventData) => {
-      historyScanCompletedForChain = data.chain;
+      if (data.scanStatus === MerkletreeScanStatus.Complete) {
+        historyScanCompletedForChain = data.chain;
+      }
     };
-    engine.on(EngineEvent.MerkletreeHistoryScanComplete, historyScanListener);
+    engine.on(EngineEvent.UTXOMerkletreeHistoryScanUpdate, historyScanListener);
     await engine.scanHistory(chain);
     expect(historyScanCompletedForChain).to.equal(chain);
-    expect(await engine.getStartScanningBlock(chain)).to.be.above(0);
+    expect(await engine.getStartScanningBlock(txidVersion, chain)).to.be.above(0);
 
-    await engine.clearSyncedMerkletreeLeaves(chain);
-    expect(await merkletree.getTreeLength(tree)).to.equal(0);
-    expect(await engine.getStartScanningBlock(chain)).to.equal(0);
+    await engine.clearSyncedUTXOMerkletreeLeaves(txidVersion, chain);
+    expect(await utxoMerkletree.getTreeLength(tree)).to.equal(0);
+    expect(await engine.getStartScanningBlock(txidVersion, chain)).to.equal(0);
 
-    await engine.fullRescanMerkletreesAndWallets(chain);
-    expect(await merkletree.getTreeLength(tree)).to.equal(1);
+    await engine.fullRescanUTXOMerkletreesAndWallets(chain);
+    expect(await utxoMerkletree.getTreeLength(tree)).to.equal(1);
   });
 
   it('[HH] Should get note hashes', async function run() {
@@ -722,7 +750,7 @@ describe('Railgun Smart Wallet', function runTests() {
 
     let result!: CommitmentEvent;
     await railgunSmartWalletContract.setTreeUpdateListeners(
-      async (commitmentEvent: CommitmentEvent) => {
+      async (_txidVersion: TXIDVersion, commitmentEvent: CommitmentEvent) => {
         result = commitmentEvent;
       },
       async () => {},
@@ -763,7 +791,7 @@ describe('Railgun Smart Wallet', function runTests() {
 
     let result!: CommitmentEvent;
     await railgunSmartWalletContract.setTreeUpdateListeners(
-      async (commitmentEvent: CommitmentEvent) => {
+      async (_txidVersion: TXIDVersion, commitmentEvent: CommitmentEvent) => {
         result = commitmentEvent;
       },
       async () => {},
@@ -826,7 +854,7 @@ describe('Railgun Smart Wallet', function runTests() {
 
     let result!: CommitmentEvent;
     await railgunSmartWalletContract.setTreeUpdateListeners(
-      async (commitmentEvent: CommitmentEvent) => {
+      async (_txidVersion: TXIDVersion, commitmentEvent: CommitmentEvent) => {
         result = commitmentEvent;
       },
       async () => {},
@@ -841,7 +869,6 @@ describe('Railgun Smart Wallet', function runTests() {
       TransactNote.createTransfer(
         wallet2.addressKeys,
         wallet.addressKeys,
-        RANDOM,
         300n,
         tokenData,
         wallet.getViewingKeyPair(),
@@ -861,6 +888,7 @@ describe('Railgun Smart Wallet', function runTests() {
       await transactionBatch.generateTransactions(
         engine.prover,
         wallet,
+        txidVersion,
         testEncryptionKey,
         () => {},
       ),

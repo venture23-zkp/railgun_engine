@@ -8,17 +8,22 @@ import { ViewOnlyWallet } from '../view-only-wallet';
 import { config } from '../../test/config.test';
 import { Chain, ChainType } from '../../models/engine-types';
 import { Database } from '../../database/database';
-import { MerkleTree } from '../../merkletree/merkletree';
 import { sha256 } from '../../utils/hash';
 import { combine } from '../../utils/bytes';
 import { RailgunEngine } from '../../railgun-engine';
 import { mnemonicToSeed } from '../../key-derivation/bip39';
+import { UTXOMerkletree } from '../../merkletree/utxo-merkletree';
+import { TXIDVersion } from '../../models';
+import { Prover } from '../../prover/prover';
+import { testArtifactsGetter } from '../../test/helper.test';
 
 chai.use(chaiAsPromised);
 const { expect } = chai;
 
+const txidVersion = TXIDVersion.V2_PoseidonMerkle;
+
 let db: Database;
-let merkletree: MerkleTree;
+let utxoMerkletree: UTXOMerkletree;
 let wallet: RailgunWallet;
 let viewOnlyWallet: ViewOnlyWallet;
 const chain: Chain = {
@@ -29,29 +34,35 @@ const chain: Chain = {
 const testMnemonic = config.mnemonic;
 const testEncryptionKey = config.encryptionKey;
 
-describe('Wallet', () => {
+describe('railgun-wallet', () => {
   beforeEach(async () => {
-    // Create database and wallet
     db = new Database(memdown());
-    merkletree = await MerkleTree.create(db, chain, async () => true);
+    utxoMerkletree = await UTXOMerkletree.create(db, chain, txidVersion, async () => true);
     wallet = await RailgunWallet.fromMnemonic(
       db,
       testEncryptionKey,
       testMnemonic,
       0,
       undefined, // creationBlockNumbers
+      new Prover(testArtifactsGetter),
     );
-    wallet.loadMerkletree(merkletree);
+    wallet.loadUTXOMerkletree(txidVersion, utxoMerkletree);
     viewOnlyWallet = await ViewOnlyWallet.fromShareableViewingKey(
       db,
       testEncryptionKey,
       wallet.generateShareableViewingKey(),
-      undefined, // creationBlockNumbers
+      undefined, // creationBlockNumbers\
+      new Prover(testArtifactsGetter),
     );
   });
 
   it('Should load existing wallet', async () => {
-    const wallet2 = await RailgunWallet.loadExisting(db, testEncryptionKey, wallet.id);
+    const wallet2 = await RailgunWallet.loadExisting(
+      db,
+      testEncryptionKey,
+      wallet.id,
+      new Prover(testArtifactsGetter),
+    );
     expect(wallet2.id).to.equal(wallet.id);
   });
 
@@ -60,6 +71,7 @@ describe('Wallet', () => {
       db,
       testEncryptionKey,
       viewOnlyWallet.id,
+      new Prover(testArtifactsGetter),
     );
     expect(viewOnlyWallet2.id).to.equal(viewOnlyWallet.id);
   });
@@ -180,12 +192,12 @@ describe('Wallet', () => {
   });
 
   it('Should get empty wallet details', async () => {
-    expect(await wallet.getWalletDetails(chain)).to.deep.equal({
+    expect(await wallet.getWalletDetails(txidVersion, chain)).to.deep.equal({
       treeScannedHeights: [],
       creationTree: undefined,
       creationTreeHeight: undefined,
     });
-    expect(await viewOnlyWallet.getWalletDetails(chain)).to.deep.equal({
+    expect(await viewOnlyWallet.getWalletDetails(txidVersion, chain)).to.deep.equal({
       treeScannedHeights: [],
       creationTree: undefined,
       creationTreeHeight: undefined,
@@ -194,7 +206,7 @@ describe('Wallet', () => {
 
   // it('Should scan ERC20 balances', async () => {
   //   await merkletree.queueLeaves(0, 0, leaves);
-  // await merkletree.updateTrees();
+  // await merkletree.updateTreesFromWriteQueue();
 
   //   const process = wallet.scanBalances(1);
 
@@ -209,7 +221,7 @@ describe('Wallet', () => {
   //   });
 
   //   await merkletree.queueLeaves(0, 6, leaves2);
-  // await merkletree.updateTrees();
+  // await merkletree.updateTreesFromWriteQueue();
 
   //   await wallet.scanBalances(1);
 
@@ -272,7 +284,7 @@ describe('Wallet', () => {
 
   afterEach(async () => {
     // Clean up database
-    wallet.unloadMerkletree(merkletree.chain);
+    wallet.unloadUTXOMerkletree(txidVersion, utxoMerkletree.chain);
     await db.close();
   });
 });
